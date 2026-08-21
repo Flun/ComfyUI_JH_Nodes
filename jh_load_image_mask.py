@@ -35,6 +35,18 @@ RMBG_CONFIG_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "rm
 SAM_MODEL_EXTENSIONS = getattr(folder_paths, "supported_pt_extensions", {".pt", ".pth", ".safetensors", ".ckpt"})
 
 
+def _resolve_video_path(video, local_path=""):
+    local_path = str(local_path or "").strip().strip('"')
+    if local_path:
+        path = os.path.normpath(os.path.expanduser(os.path.expandvars(local_path)))
+        if not os.path.isabs(path):
+            raise ValueError("Local video path must be an absolute path.")
+        if not os.path.isfile(path):
+            raise ValueError(f"Local video file not found: {path}")
+        return path
+    return folder_paths.get_annotated_filepath(video)
+
+
 def _sam_model_choices():
     choices = [name for name in folder_paths.get_filename_list("checkpoints") if "sam3" in name.lower()]
     for family in ("sam3", "sam2"):
@@ -509,7 +521,7 @@ class JHLoadVideoMask(JHLoadImageMask):
         checkpoints.sort(key=lambda name: ("sam3" not in name.lower(), name.lower()))
         return {
             "required": {
-                "video": (sorted(files), {"video_upload": True}),
+                "video": (sorted(files) or [""], {"video_upload": True}),
                 "slot_config": ("STRING", {"default": "", "multiline": False}),
                 "max_megapixels": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 128.0, "step": 0.01}),
                 "selection_mode": (["REMOVE SELECTED", "KEEP SELECTED"],),
@@ -519,10 +531,15 @@ class JHLoadVideoMask(JHLoadImageMask):
                 "skip_first_frames": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1}),
                 "detect_interval": ("INT", {"default": 1, "min": 1, "max": 120, "step": 1}),
                 "max_objects": ("INT", {"default": 4, "min": 1, "max": 64, "step": 1}),
+            },
+            "optional": {
+                # Optional and last so workflows/API prompts created before this
+                # option was added remain valid and keep their widget positions.
+                "local_path": ("STRING", {"default": "", "multiline": False}),
             }
         }
 
-    def load(self, video, slot_config="", max_megapixels=0.0, selection_mode="REMOVE SELECTED", sam3_model="",
+    def load(self, video, local_path="", slot_config="", max_megapixels=0.0, selection_mode="REMOVE SELECTED", sam3_model="",
              force_rate=0.0, frame_load_cap=0, skip_first_frames=0, detect_interval=1, max_objects=4):
         try:
             max_megapixels = float(max_megapixels)
@@ -531,7 +548,7 @@ class JHLoadVideoMask(JHLoadImageMask):
         if not math.isfinite(max_megapixels) or max_megapixels < 0:
             max_megapixels = 0.0
 
-        video_path = folder_paths.get_annotated_filepath(video)
+        video_path = _resolve_video_path(video, local_path)
         source_video = InputImpl.VideoFromFile(video_path)
         source_rate = source_video.get_frame_rate()
         source_frame_count = source_video.get_frame_count()
@@ -634,13 +651,19 @@ class JHLoadVideoMask(JHLoadImageMask):
         return masked_video, final_mask, rgb_video, masked_rgb, processed_rgb, audio, video_info
 
     @classmethod
-    def IS_CHANGED(cls, video, slot_config="", max_megapixels=0.0, selection_mode="REMOVE SELECTED", sam3_model="",
+    def IS_CHANGED(cls, video, local_path="", slot_config="", max_megapixels=0.0, selection_mode="REMOVE SELECTED", sam3_model="",
                    force_rate=0.0, frame_load_cap=0, skip_first_frames=0, detect_interval=1, max_objects=4):
-        video_path = folder_paths.get_annotated_filepath(video)
+        video_path = _resolve_video_path(video, local_path)
         return f"{os.path.getmtime(video_path)}:{slot_config}:{max_megapixels}:{selection_mode}:{sam3_model}:{force_rate}:{frame_load_cap}:{skip_first_frames}:{detect_interval}:{max_objects}"
 
     @classmethod
-    def VALIDATE_INPUTS(cls, video, **kwargs):
+    def VALIDATE_INPUTS(cls, video, local_path="", **kwargs):
+        if str(local_path or "").strip():
+            try:
+                _resolve_video_path(video, local_path)
+            except (OSError, ValueError) as error:
+                return str(error)
+            return True
         if not folder_paths.exists_annotated_filepath(video):
             return f"Invalid video file: {video}"
         return True

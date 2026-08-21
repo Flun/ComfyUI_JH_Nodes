@@ -8,6 +8,8 @@ import json
 import os
 import random
 import re
+import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -23,6 +25,7 @@ from PIL import Image, ImageOps
 
 import comfy.model_management
 import folder_paths
+from comfy_execution.progress import get_progress_state
 from server import PromptServer
 
 try:
@@ -49,6 +52,8 @@ ACTIVE_DRIVER_PIDS = set()
 SESSION_SEEN_KEYS = set()
 SESSION_SEEN_HASHES = set()
 SESSION_OUTPUT_COUNT = 0
+PENDING_HISTORY = {}
+PENDING_HISTORY_LOCK = threading.Lock()
 ACTIVE_DC_POSTS = {}
 LAST_DC_OUTPUT_POSTS = {}
 DC_PAGE_CACHE = {}
@@ -60,10 +65,16 @@ DC_PAGE_CACHE_TTL = 300
 DHASH_MAX_DISTANCE = 4
 MAX_SOURCE_SEARCH_PASSES = 3
 UNLIMITED_RETRY_DELAY = 5.0
+DEFAULT_SEARCH_TIMEOUT_MINUTES = 10
 MAX_COLLECTION_ATTEMPTS = 6
 MAX_ARCA_PAGE_SCANS = 25
 MAX_SUCCESSFUL_SEARCHES_PER_SOURCE = 30
-SOURCE_TYPES = ("Google Images", "Instagram User", "Instagram Hashtag", "Reddit Subreddit", "DCInside Gallery", "Arca.live Channel", "Website URL", "X Search", "Mixed Sources")
+LOCAL_DIRECTORY_SOURCE = "Local / NAS Directory"
+SOURCE_TYPES = ("Google Images", LOCAL_DIRECTORY_SOURCE, "Instagram User", "Instagram Hashtag", "Reddit Subreddit", "DCInside Gallery", "Arca.live Channel", "Website URL", "X Search", "Mixed Sources")
+LOCAL_IMAGE_EXTENSIONS = {
+    ".apng", ".avif", ".bmp", ".gif", ".heic", ".heif", ".jfif", ".jpeg", ".jpg",
+    ".png", ".tif", ".tiff", ".webp",
+}
 DC_GALLERIES = (
     "실시간 베스트 갤러리 (dcbest)",
     "여자 갤러리 (duwk)",
@@ -113,7 +124,10 @@ def delete_auto_feed_preset(preset_id):
 def _successful_search_preset(source, query, title_filter, search_mode, dc_gallery, dc_gallery_custom,
                               arca_channel, arca_mode, reddit_mode, reddit_subreddit, reddit_keyword):
     values = {}
-    if source == "DCInside Gallery":
+    if source == LOCAL_DIRECTORY_SOURCE:
+        values = {"directory_path": query}
+        label = query
+    elif source == "DCInside Gallery":
         values = {"dc_gallery": dc_gallery, "dc_gallery_custom": dc_gallery_custom, "title_filter": title_filter}
         gallery_label = dc_gallery_custom if dc_gallery == DC_GALLERIES[-1] and dc_gallery_custom else dc_gallery
         label = " / ".join(value for value in (gallery_label, title_filter) if value)
@@ -161,9 +175,27 @@ def _find_chrome():
         os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Google", "Chrome", "Application", "chrome.exe"),
         os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
     ]
+    if os.name != "nt":
+        candidates += [
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/google-chrome",
+            "/snap/bin/chromium",
+            "/opt/google/chrome/chrome",
+            "/opt/chromium/chromium",
+            "/usr/bin/microsoft-edge",
+            "/usr/bin/microsoft-edge-stable",
+        ]
     for path in candidates:
         if os.path.isfile(path):
             return path
+    if os.name != "nt":
+        for name in ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser"):
+            resolved = shutil.which(name)
+            if resolved:
+                return resolved
     raise RuntimeError("Google Chrome was not found")
 
 
@@ -184,51 +216,86 @@ def _remove_driver_pid(pid=None):
         pass
 
 
+def _linux_crawler_pids():
+    """Return PIDs of processes whose command line references the JH profile dir."""
+    try:
+        output = subprocess.run(
+            ["pgrep", "-f", PROFILE_DIR],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [int(pid) for pid in output.split() if pid.strip().isdigit()]
+
+
+def _linux_pid_is_crawler(pid):
+    """True if the PID's command line references the JH profile dir or chromedriver."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as file:
+            cmdline = file.read().decode(errors="replace").replace("\0", " ")
+    except OSError:
+        return False
+    return PROFILE_DIR in cmdline or "chromedriver" in cmdline
+
+
+def _linux_kill(pid):
+    try:
+        os.kill(pid, signal.SIGKILL)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
 def _cleanup_stale_driver():
-    if os.name != "nt":
-        return
     with BROWSER_LOCK:
         pid = _stored_driver_pid()
         if pid is None:
             return
         if pid in ACTIVE_DRIVER_PIDS:
             raise RuntimeError("The JH crawler is already using the browser profile.")
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.stdout.lstrip().lower().startswith('"chromedriver.exe"'):
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+        if os.name == "nt":
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=10,
             )
+            if result.stdout.lstrip().lower().startswith('"chromedriver.exe"'):
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                )
+        elif _linux_pid_is_crawler(pid):
+            _linux_kill(pid)
         _remove_driver_pid(pid)
 
 
 def stop_active_crawlers():
-    if os.name != "nt":
-        return 0
     with BROWSER_LOCK:
         pids = list(ACTIVE_DRIVER_PIDS)
+    if os.name == "nt":
+        stopped = 0
+        for pid in pids:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if not result.stdout.lstrip().lower().startswith('"chromedriver.exe"'):
+                continue
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+            )
+            stopped += 1
+        return stopped
+    profile_pids = [pid for pid in _linux_crawler_pids() if _linux_pid_is_crawler(pid)]
+    target_pids = list(dict.fromkeys(pids + profile_pids))
     stopped = 0
-    for pid in pids:
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if not result.stdout.lstrip().lower().startswith('"chromedriver.exe"'):
-            continue
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
-        )
-        stopped += 1
+    for pid in target_pids:
+        if _linux_kill(pid):
+            stopped += 1
     return stopped
 
 
 def _remember_driver(driver):
-    if os.name != "nt":
-        return
     pid = driver.service.process.pid
     with BROWSER_LOCK:
         os.makedirs(FEED_DIR, exist_ok=True)
@@ -238,7 +305,7 @@ def _remember_driver(driver):
 
 
 def _close_driver(driver):
-    pid = driver.service.process.pid if os.name == "nt" else None
+    pid = driver.service.process.pid
     try:
         try:
             driver.quit()
@@ -276,7 +343,12 @@ def _interruptible_wait(driver, timeout, condition):
 def _source_url(source, query, period, safe_search, search_mode="Top", reddit_mode="Subreddit", ranking="Source Order", arca_mode="Best"):
     query = query.strip()
     if not query:
-        raise ValueError("query is empty")
+        raise ValueError("directory path is empty" if source == LOCAL_DIRECTORY_SOURCE else "query is empty")
+    if source == LOCAL_DIRECTORY_SOURCE:
+        path = os.path.abspath(os.path.expandvars(os.path.expanduser(query.strip('"'))))
+        if not os.path.isdir(path):
+            raise ValueError(f"Local / NAS directory does not exist or is not accessible: {path}")
+        return path
     if source == "Google Images":
         params = {"tbm": "isch", "q": query, "safe": "active" if safe_search == "On" else "off"}
         if ranking == "Newest First":
@@ -442,12 +514,28 @@ def _known_hash(content_hash):
 
 def _session_known_keys(source, keys):
     with SESSION_LOCK:
-        return {key for key in keys if (source, key) in SESSION_SEEN_KEYS}
+        known = {key for key in keys if (source, key) in SESSION_SEEN_KEYS}
+    with PENDING_HISTORY_LOCK:
+        for records in PENDING_HISTORY.values():
+            pending_keys = {
+                record["candidate"]["key"] for record in records
+                if record["source"] == source
+            }
+            known.update(key for key in keys if key in pending_keys)
+    return known
 
 
 def _session_known_hash(content_hash):
     with SESSION_LOCK:
-        return any(_hash_distance(content_hash, known_hash) <= DHASH_MAX_DISTANCE for known_hash in SESSION_SEEN_HASHES)
+        known_hashes = tuple(SESSION_SEEN_HASHES)
+    with PENDING_HISTORY_LOCK:
+        known_hashes += tuple(
+            record["content_hash"]
+            for records in PENDING_HISTORY.values()
+            for record in records
+            if record.get("content_hash")
+        )
+    return any(_hash_distance(content_hash, known_hash) <= DHASH_MAX_DISTANCE for known_hash in known_hashes)
 
 
 def _hash_distance(first, second):
@@ -484,7 +572,70 @@ def _record_candidate(source, candidate, status, content_hash=None, score=None):
         )
 
 
-def _claim_media(source, candidate, enforce_history):
+def _stage_candidate_until_success(source, candidate, content_hash, score, session_keys=()):
+    prompt_id = get_progress_state().prompt_id
+    if not prompt_id:
+        print("[JH Auto Image Feed] Prompt ID unavailable; recording accepted history immediately.")
+        _record_session(source, candidate["key"], content_hash, output=True)
+        for item_key in session_keys:
+            _record_session(source, item_key)
+        _record_candidate(source, candidate, "accepted", content_hash, score)
+        return
+    record = {
+        "source": source,
+        "candidate": dict(candidate),
+        "content_hash": content_hash,
+        "score": score,
+        "session_keys": tuple(session_keys),
+    }
+    with PENDING_HISTORY_LOCK:
+        records = PENDING_HISTORY.setdefault(prompt_id, [])
+        records[:] = [
+            current for current in records
+            if (current["source"], current["candidate"]["key"]) != (source, candidate["key"])
+        ]
+        records.append(record)
+
+
+def _finish_pending_history(prompt_id, succeeded):
+    if not prompt_id:
+        return
+    with PENDING_HISTORY_LOCK:
+        records = PENDING_HISTORY.pop(prompt_id, [])
+    if not succeeded:
+        return
+    for record in records:
+        source = record["source"]
+        candidate = record["candidate"]
+        content_hash = record["content_hash"]
+        _record_candidate(source, candidate, "accepted", content_hash, record["score"])
+        _record_session(source, candidate["key"], content_hash, output=True)
+        for item_key in record["session_keys"]:
+            _record_session(source, item_key)
+
+
+def _install_history_completion_hook():
+    server = getattr(PromptServer, "instance", None)
+    if server is None:
+        return False
+    current = server.send_sync
+    if getattr(current, "_jh_auto_feed_history_hook", False):
+        return True
+
+    def send_sync_with_history(event, data, sid=None):
+        if event in ("execution_success", "execution_error", "execution_interrupted"):
+            try:
+                _finish_pending_history(data.get("prompt_id"), event == "execution_success")
+            except Exception as error:
+                print(f"[JH Auto Image Feed] Could not finalize deferred history: {error}")
+        return current(event, data, sid)
+
+    send_sync_with_history._jh_auto_feed_history_hook = True
+    server.send_sync = send_sync_with_history
+    return True
+
+
+def _claim_media(source, candidate, enforce_history, persist_history=False):
     if not enforce_history:
         return True
     media_key = "media:" + candidate["media_id"]
@@ -516,8 +667,9 @@ def _claim_media(source, candidate, enforce_history):
         "media_type": candidate["media_type"],
         "media_extension": candidate.get("media_extension", ""),
     }
-    _record_session(source, media_key)
-    _record_candidate(source, media_record, "media_captured")
+    if persist_history:
+        _record_session(source, media_key)
+        _record_candidate(source, media_record, "media_captured")
     return True
 
 
@@ -528,6 +680,9 @@ def _accepted_count():
 
 def _mixed_sources(value):
     aliases = {
+        "local": LOCAL_DIRECTORY_SOURCE,
+        "directory": LOCAL_DIRECTORY_SOURCE,
+        "nas": LOCAL_DIRECTORY_SOURCE,
         "google": "Google Images",
         "instagram_user": "Instagram User",
         "instagram_tag": "Instagram Hashtag",
@@ -631,12 +786,21 @@ def _download_image(url, page_url):
     return next(_image_frames(_download_image_bytes(url, page_url), 1, 1))[0]
 
 
-def _candidate_frames(source_name, candidate, media_mode, scan_fps, max_seconds, enforce_history):
+def _read_local_image_bytes(path):
+    size = os.path.getsize(path)
+    if size > MAX_IMAGE_BYTES:
+        raise RuntimeError("candidate image exceeds 50 MB")
+    with open(path, "rb") as file:
+        return file.read()
+
+
+def _candidate_frames(source_name, candidate, media_mode, scan_fps, max_seconds, enforce_history, persist_history=False):
     if candidate.get("frame_bytes") is not None:
         with Image.open(io.BytesIO(candidate["frame_bytes"])) as frame:
             yield frame.convert("RGB"), candidate.get("frame_index", 0), candidate.get("frame_time", 0.0)
         return
-    data = _download_image_bytes(candidate["url"], candidate["page_url"])
+    local_path = candidate.get("local_path")
+    data = _read_local_image_bytes(local_path) if local_path else _download_image_bytes(candidate["url"], candidate["page_url"])
     with Image.open(io.BytesIO(data)) as source:
         image_format = (source.format or "image").lower()
         candidate["media_format"] = image_format
@@ -646,7 +810,7 @@ def _candidate_frames(source_name, candidate, media_mode, scan_fps, max_seconds,
             candidate["media_id"] = hashlib.sha256(
                 (candidate["page_url"] + "\n" + candidate["url"]).encode("utf-8")
             ).hexdigest()
-            if not _claim_media(source_name, candidate, enforce_history):
+            if not _claim_media(source_name, candidate, enforce_history, persist_history):
                 return
     if media_mode == "Images + Video/GIF":
         yield from _image_frames(data, scan_fps, max_seconds)
@@ -654,11 +818,63 @@ def _candidate_frames(source_name, candidate, media_mode, scan_fps, max_seconds,
         yield next(_image_frames(data, 1, 1))
 
 
+def _local_directory_candidates(directory, recursive, read_dimensions=True):
+    candidates = []
+    walk = os.walk(directory)
+    for current_directory, child_directories, filenames in walk:
+        child_directories.sort(key=str.casefold)
+        filenames.sort(key=str.casefold)
+        for filename in filenames:
+            _check_interrupted()
+            extension = os.path.splitext(filename)[1].lower()
+            if extension not in LOCAL_IMAGE_EXTENSIONS:
+                continue
+            path = os.path.abspath(os.path.join(current_directory, filename))
+            try:
+                stat = os.stat(path)
+                width = height = 0
+                frame_count = 1
+                if read_dimensions:
+                    with Image.open(path) as image:
+                        width, height = image.size
+                        frame_count = getattr(image, "n_frames", 1)
+            except (OSError, ValueError):
+                continue
+            identity = f"{os.path.normcase(path)}\n{stat.st_size}\n{stat.st_mtime_ns}"
+            candidates.append({
+                "key": "local:" + hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+                "url": path,
+                "page_url": current_directory,
+                "local_path": path,
+                "filename": filename,
+                "relative_path": os.path.relpath(path, directory),
+                "width": width,
+                "height": height,
+                "post_date": datetime.datetime.fromtimestamp(stat.st_mtime, datetime.timezone.utc).isoformat(),
+                "media_type": "animated_image" if frame_count > 1 else "image",
+                "file_size": stat.st_size,
+            })
+        if not recursive:
+            break
+    candidates.sort(key=lambda candidate: candidate["relative_path"].casefold())
+    return candidates
+
+
 def _dhash(image):
     pixels = np.asarray(image.convert("L").resize((9, 8), Image.Resampling.LANCZOS))
     bits = pixels[:, 1:] > pixels[:, :-1]
     value = sum(int(bit) << index for index, bit in enumerate(bits.flat))
     return f"{value:016x}"
+
+
+def _image_history_hash(source, image):
+    if source != LOCAL_DIRECTORY_SOURCE:
+        return _dhash(image)
+    rgb = image.convert("RGB")
+    digest = hashlib.sha256()
+    digest.update(f"{rgb.width}x{rgb.height}\0".encode("ascii"))
+    digest.update(rgb.tobytes())
+    return digest.hexdigest()
 
 
 def _pil_to_tensor(image):
@@ -845,6 +1061,18 @@ class _RetrySourceLater(_ContinueSourceSearch):
     pass
 
 
+class _SimpleImagePassThrough:
+    @staticmethod
+    def analyze(image):
+        return {
+            "score": 0.0,
+            "face_confidence": 0.0,
+            "crop_box": None,
+            "woman_count": 0,
+            "person_count": 0,
+        }
+
+
 def _crop_primary_woman(image, analysis, crop_mode, margin):
     crop_box = analysis["crop_box"]
     if not crop_box or crop_mode == "None":
@@ -884,6 +1112,8 @@ def _make_driver(headless):
     options.add_experimental_option("useAutomationExtension", False)
     if headless:
         options.add_argument("--headless=new")
+    if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
+        options.add_argument("--no-sandbox")
     try:
         driver = webdriver.Chrome(options=options)
     except WebDriverException as error:
@@ -1921,6 +2151,7 @@ class JHAutoImageFeed:
                 "title_filter": ("STRING", {"default": ""}),
                 "search_mode": (["Top", "Latest"],),
                 "history_mode": (["Normal", "Test (No Write)", "Allow Duplicates"],),
+                "history_commit": (["On Image Load", "On Workflow Success"],),
                 "orientation_mode": (["EXIF", "EXIF + Auto Rotate"],),
                 "crop_mode": (["None", "Auto Composite", "Primary Woman"],),
                 "crop_margin": ("FLOAT", {"default": 0.08, "min": 0.0, "max": 0.5, "step": 0.01}),
@@ -1944,6 +2175,10 @@ class JHAutoImageFeed:
                 "face_model": (models, {"default": _preferred_model(models, "face_yolov8n.pt", models[0])}),
                 "arca_mode": (["Best", "All"],),
                 "url_single_character_sheet": ("BOOLEAN", {"default": True, "label_on": "One", "label_off": "Every image"}),
+                "directory_path": ("STRING", {"default": ""}),
+                "directory_recursive": ("BOOLEAN", {"default": True}),
+                "processing_mode": (["Advanced", "Simple"],),
+                "search_timeout_minutes": ("INT", {"default": DEFAULT_SEARCH_TIMEOUT_MINUTES, "min": 1, "max": 1440}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -1960,15 +2195,32 @@ class JHAutoImageFeed:
 
     def next_image(self, source, query, ranking, period, safe_search, scroll_rounds, max_candidates,
                    woman_threshold, woman_model, person_model, seed, headless, title_filter="", search_mode="Top",
-                   history_mode="Normal", orientation_mode="EXIF", crop_mode="None", crop_margin=0.08,
+                   history_mode="Normal", history_commit="On Image Load", orientation_mode="EXIF", crop_mode="None", crop_margin=0.08,
                    dc_gallery="직접 입력 (ID/URL)", dc_gallery_custom="", dc_random_mode="Random Across Posts",
                    arca_channel="aireal",
                    reddit_mode="Subreddit", reddit_subreddit="", reddit_keyword="",
                    media_mode="Images + Video/GIF", video_scan_fps=2.0, video_max_seconds=30, unique_id=None,
                    quality_filter=False, min_popularity=10, min_comments=0, min_views=0,
                    min_megapixels=0.0, face_check=False, face_confidence=0.4, face_model=None, arca_mode="Best",
-                   url_single_character_sheet=True):
-        detector = WomanSubjectDetector(woman_model, person_model, face_model if face_check else None)
+                   url_single_character_sheet=True, directory_path="", directory_recursive=True,
+                   processing_mode="Advanced", search_timeout_minutes=DEFAULT_SEARCH_TIMEOUT_MINUTES):
+        _install_history_completion_hook()
+        if history_mode == "On Workflow Success":
+            history_mode = "Normal"
+            history_commit = "On Workflow Success"
+        simple_mode = processing_mode == "Simple"
+        if simple_mode:
+            detector = _SimpleImagePassThrough()
+            woman_threshold = 0.0
+            orientation_mode = "EXIF"
+            crop_mode = "None"
+            min_megapixels = 0.0
+            face_check = False
+            quality_filter = False
+        else:
+            detector = WomanSubjectDetector(woman_model, person_model, face_model if face_check else None)
+        if source == LOCAL_DIRECTORY_SOURCE:
+            query = directory_path.strip() or query
         preset_args = (source, query, title_filter, search_mode, dc_gallery, dc_gallery_custom, arca_channel, arca_mode, reddit_mode, reddit_subreddit, reddit_keyword)
         if source != "Mixed Sources":
             if source == "DCInside Gallery":
@@ -1979,9 +2231,11 @@ class JHAutoImageFeed:
                 query = (reddit_keyword if reddit_mode == "Keyword Search" else reddit_subreddit).strip() or query
             result = self._next_from_source(source, query, ranking, period, safe_search, scroll_rounds, max_candidates,
                                             woman_threshold, seed, headless, title_filter, search_mode, history_mode,
+                                            history_commit,
                                             orientation_mode, crop_mode, crop_margin, detector, dc_random_mode, reddit_mode,
                                             media_mode, video_scan_fps, video_max_seconds, quality_filter, min_popularity,
-                                            min_comments, min_views, min_megapixels, face_check, face_confidence, unique_id, arca_mode)
+                                            min_comments, min_views, min_megapixels, face_check, face_confidence, unique_id, arca_mode,
+                                            directory_recursive, processing_mode, search_timeout_minutes)
             if source == "Website URL" and url_single_character_sheet:
                 best_index = max(range(len(result[0])), key=lambda index: (
                     result[4][index], result[0][index].shape[1] * result[0][index].shape[2]
@@ -1995,7 +2249,10 @@ class JHAutoImageFeed:
 
         specs = _mixed_sources(query)
         mixed_pass = 0
+        mixed_deadline = time.monotonic() + max(1, search_timeout_minutes) * 60
         while max_candidates == 0 or mixed_pass == 0:
+            if max_candidates == 0 and time.monotonic() >= mixed_deadline:
+                raise RuntimeError(f"Mixed Sources search timed out after {search_timeout_minutes} minutes without a usable image.")
             random.Random(seed + _accepted_count() + _session_output_count() + mixed_pass).shuffle(specs)
             errors = []
             for index, (mixed_source, mixed_query, mixed_title_filter, mixed_search_mode) in enumerate(specs):
@@ -2003,10 +2260,12 @@ class JHAutoImageFeed:
                     result = self._next_from_source(
                         mixed_source, mixed_query, ranking, period, safe_search, scroll_rounds, 200 if max_candidates == 0 else max_candidates,
                         woman_threshold, seed + mixed_pass * len(specs) + index, headless, mixed_title_filter, mixed_search_mode, history_mode,
+                        history_commit,
                         orientation_mode, crop_mode, crop_margin, detector, dc_random_mode, "Subreddit",
                         media_mode, video_scan_fps, video_max_seconds,
                         quality_filter, min_popularity, min_comments, min_views,
-                        min_megapixels, face_check, face_confidence, unique_id, arca_mode,
+                        min_megapixels, face_check, face_confidence, unique_id, arca_mode, directory_recursive,
+                        processing_mode, search_timeout_minutes,
                     )
                     _record_successful_search(*preset_args)
                     return result
@@ -2020,37 +2279,53 @@ class JHAutoImageFeed:
 
     def _next_from_source(self, source, query, ranking, period, safe_search, scroll_rounds, max_candidates,
                           woman_threshold, seed, headless, title_filter, search_mode, history_mode,
+                          history_commit,
                           orientation_mode, crop_mode, crop_margin, detector, dc_random_mode, reddit_mode="Subreddit",
                           media_mode="Images + Video/GIF", video_scan_fps=2.0, video_max_seconds=30,
                           quality_filter=False, min_popularity=10, min_comments=0, min_views=0,
-                          min_megapixels=0.0, face_check=False, face_confidence=0.4, unique_id=None, arca_mode="Best"):
-        unlimited_search = max_candidates == 0
-        if unlimited_search:
+                          min_megapixels=0.0, face_check=False, face_confidence=0.4, unique_id=None, arca_mode="Best",
+                          directory_recursive=True, processing_mode="Advanced",
+                          search_timeout_minutes=DEFAULT_SEARCH_TIMEOUT_MINUTES):
+        unlimited_search = max_candidates == 0 and source != LOCAL_DIRECTORY_SOURCE
+        if source == LOCAL_DIRECTORY_SOURCE and max_candidates == 0:
+            max_candidates = 2 ** 31 - 1
+        elif unlimited_search:
             max_candidates = 200
+        search_deadline = time.monotonic() + max(1, search_timeout_minutes) * 60
         search_pass = 0
         last_failure = ""
         driver = None
         browser_state = {}
         _send_auto_feed_status(unique_id, f"Starting {source} crawler...")
         try:
-            if source != "DCInside Gallery":
+            if source not in ("DCInside Gallery", LOCAL_DIRECTORY_SOURCE):
                 driver = _make_driver(headless)
             while unlimited_search or search_pass < MAX_SOURCE_SEARCH_PASSES:
                 _check_interrupted()
+                if unlimited_search and time.monotonic() >= search_deadline:
+                    raise RuntimeError(
+                        f"{source} search timed out after {search_timeout_minutes} minutes without a usable image."
+                    )
                 batch_total = "unlimited" if unlimited_search else str(MAX_SOURCE_SEARCH_PASSES)
                 _send_auto_feed_status(unique_id, f"Loading candidate batch {search_pass + 1}/{batch_total}...")
                 try:
                     return self._next_from_source_once(
                         source, query, ranking, period, safe_search, scroll_rounds, max_candidates,
                         woman_threshold, seed + search_pass, headless, title_filter, search_mode, history_mode,
+                        history_commit,
                         orientation_mode, crop_mode, crop_margin, detector, dc_random_mode, reddit_mode,
                         media_mode, video_scan_fps, video_max_seconds, quality_filter, min_popularity,
-                        min_comments, min_views, min_megapixels, face_check, face_confidence, unique_id, driver, browser_state, arca_mode, unlimited_search,
+                        min_comments, min_views, min_megapixels, face_check, face_confidence, unique_id, driver, browser_state, arca_mode,
+                        directory_recursive, processing_mode, unlimited_search,
                     )
                 except _ContinueSourceSearch as error:
                     last_failure = str(error)
                     search_pass += 1
                     if isinstance(error, _RetrySourceLater):
+                        if time.monotonic() + UNLIMITED_RETRY_DELAY >= search_deadline:
+                            raise RuntimeError(
+                                f"{source} search timed out after {search_timeout_minutes} minutes without a usable image."
+                            )
                         _send_auto_feed_status(unique_id, f"No usable image is currently available. Retrying in {UNLIMITED_RETRY_DELAY:g} seconds...")
                         _interruptible_sleep(UNLIMITED_RETRY_DELAY)
             error = RuntimeError(
@@ -2068,13 +2343,16 @@ class JHAutoImageFeed:
 
     def _next_from_source_once(self, source, query, ranking, period, safe_search, scroll_rounds, max_candidates,
                                woman_threshold, seed, headless, title_filter, search_mode, history_mode,
+                               history_commit,
                                orientation_mode, crop_mode, crop_margin, detector, dc_random_mode, reddit_mode,
                                media_mode, video_scan_fps, video_max_seconds, quality_filter, min_popularity,
                                min_comments, min_views, min_megapixels, face_check, face_confidence, unique_id, driver, browser_state, arca_mode,
-                               unlimited_search=False):
+                               directory_recursive=True, processing_mode="Advanced", unlimited_search=False):
         source_url = _source_url(source, query, period, safe_search, search_mode, reddit_mode, ranking, arca_mode)
         enforce_history = history_mode != "Allow Duplicates"
-        record_history = history_mode == "Normal"
+        write_history = history_mode == "Normal"
+        record_history = write_history and history_commit == "On Image Load"
+        defer_history = write_history and history_commit == "On Workflow Success"
         collect_all = source == "Website URL"
         accepted_outputs = ([], [], [], [], [], [])
         accepted_records = []
@@ -2083,7 +2361,19 @@ class JHAutoImageFeed:
         more_candidates_available = False
         current_arca_page = None
         arca_cursor_key = None
-        if source == "DCInside Gallery":
+        if source == LOCAL_DIRECTORY_SOURCE:
+            read_local_dimensions = processing_mode != "Simple" or ranking == "Largest First"
+            collected_candidates = _local_directory_candidates(source_url, directory_recursive, read_local_dimensions)
+            unseen_candidates = _unseen_candidates(source, collected_candidates, enforce_history)
+            more_candidates_available = len(unseen_candidates) > max_candidates
+            candidates = unseen_candidates
+            last_scan_status = (
+                f"directory scan found {len(collected_candidates)} images, "
+                f"history/duplicate skipped {len(collected_candidates) - len(unseen_candidates)}, "
+                f"ready to inspect {min(len(candidates), max_candidates)}"
+            )
+            _send_auto_feed_status(unique_id, last_scan_status.capitalize() + ".")
+        elif source == "DCInside Gallery":
             avoid_previous_post = ranking == "Random" and dc_random_mode == "Random Across Posts"
             seen_post_keys = set()
             if avoid_previous_post and enforce_history:
@@ -2235,7 +2525,7 @@ class JHAutoImageFeed:
         elif ranking == "Largest First":
             candidates.sort(key=lambda item: item.get("width", 0) * item.get("height", 0), reverse=True)
         elif ranking == "Newest First":
-            if source not in ("Google Images", "DCInside Gallery", "Arca.live Channel") and period != "All":
+            if source not in (LOCAL_DIRECTORY_SOURCE, "Google Images", "DCInside Gallery", "Arca.live Channel") and period != "All":
                 candidates = _filter_recent_candidates(candidates, period)
             candidates.sort(key=lambda item: (
                 not item.get("is_pinned", False),
@@ -2243,14 +2533,19 @@ class JHAutoImageFeed:
             ), reverse=True)
         elif source == "Reddit Subreddit":
             candidates.sort(key=lambda item: item.get("rank_score", 0), reverse=True)
+        if source == LOCAL_DIRECTORY_SOURCE:
+            candidates = candidates[:max_candidates]
 
         rejected = {"small": 0, "session_duplicate": 0, "history_duplicate": 0, "woman": 0, "face": 0, "error": 0}
         for candidate_index, candidate in enumerate(candidates, 1):
             candidate_accepted = False
             _check_interrupted()
-            _send_auto_feed_status(unique_id, f"Inspecting candidate {candidate_index}/{len(candidates)}...")
+            action = "Loading" if processing_mode == "Simple" else "Inspecting"
+            _send_auto_feed_status(unique_id, f"{action} candidate {candidate_index}/{len(candidates)}...")
             try:
-                frames = _candidate_frames(source, candidate, media_mode, video_scan_fps, video_max_seconds, enforce_history)
+                frames = _candidate_frames(
+                    source, candidate, media_mode, video_scan_fps, video_max_seconds, enforce_history, record_history
+                )
                 last_hash = None
                 last_score = None
                 for image, frame_index, frame_time in frames:
@@ -2260,25 +2555,25 @@ class JHAutoImageFeed:
                     if megapixels < min_megapixels:
                         rejected["small"] += 1
                         _send_auto_feed_status(unique_id, f"Rejected {candidate_index}/{len(candidates)}: {megapixels:.2f} MP is below {min_megapixels:.2f} MP.")
-                        last_hash = candidate.get("_content_hash") or _dhash(image)
-                        _record_session(source, frame_key, last_hash)
+                        last_hash = candidate.get("_content_hash") or _image_history_hash(source, image)
+                        _record_session(source, frame_key)
                         continue
                     analysis = candidate.get("_analysis")
                     orientation_transform = "EXIF"
                     if orientation_mode == "EXIF + Auto Rotate":
                         image, analysis, orientation_transform = detector.auto_orient(image, woman_threshold)
                     content_hash = candidate.get("_content_hash") if orientation_transform == "EXIF" else None
-                    content_hash = content_hash or _dhash(image)
+                    content_hash = content_hash or _image_history_hash(source, image)
                     last_hash = content_hash
                     if enforce_history and _session_known_hash(content_hash):
                         rejected["session_duplicate"] += 1
                         _send_auto_feed_status(unique_id, f"Rejected {candidate_index}/{len(candidates)}: duplicate image from this session.")
-                        _record_session(source, frame_key, content_hash)
+                        _record_session(source, frame_key)
                         continue
                     if enforce_history and _known_hash(content_hash):
                         rejected["history_duplicate"] += 1
                         _send_auto_feed_status(unique_id, f"Rejected {candidate_index}/{len(candidates)}: image already exists in feed history.")
-                        _record_session(source, frame_key, content_hash)
+                        _record_session(source, frame_key)
                         continue
                     if analysis is None:
                         analysis = detector.analyze(image)
@@ -2287,12 +2582,12 @@ class JHAutoImageFeed:
                     if score < woman_threshold:
                         rejected["woman"] += 1
                         _send_auto_feed_status(unique_id, f"Rejected {candidate_index}/{len(candidates)}: woman score {score:.3f} is below {woman_threshold:.3f}.")
-                        _record_session(source, frame_key, content_hash)
+                        _record_session(source, frame_key)
                         continue
                     if face_check and analysis["face_confidence"] < face_confidence:
                         rejected["face"] += 1
                         _send_auto_feed_status(unique_id, f"Rejected {candidate_index}/{len(candidates)}: face score {analysis['face_confidence']:.3f} is below {face_confidence:.3f}.")
-                        _record_session(source, frame_key, content_hash)
+                        _record_session(source, frame_key)
                         continue
                     original_size = image.size
                     input_preview = image.copy()
@@ -2308,6 +2603,8 @@ class JHAutoImageFeed:
                     candidate["output_size"] = image.size
                     candidate["crop_box"] = crop_box
                     candidate["history_mode"] = history_mode
+                    candidate["history_commit"] = history_commit
+                    candidate["processing_mode"] = processing_mode
                     candidate["frame_index"] = frame_index
                     candidate["frame_time"] = frame_time
                     if candidate.get("media_type") != "video_frame" and frame_index:
@@ -2315,13 +2612,20 @@ class JHAutoImageFeed:
                     if collect_all:
                         accepted_records.append((dict(candidate), content_hash, score))
                     else:
-                        _record_session(source, candidate["key"], content_hash, output=True)
+                        dc_post_keys = ()
                         if source == "DCInside Gallery" and dc_random_mode == "Random Across Posts":
-                            _record_session(source, candidate["post_key"])
-                            with SESSION_LOCK:
-                                LAST_DC_OUTPUT_POSTS[(source_url, title_filter)] = candidate["page_url"]
-                        if record_history:
-                            _record_candidate(source, candidate, "accepted", content_hash, score)
+                            dc_post_keys = (candidate["post_key"],)
+                        if defer_history:
+                            _stage_candidate_until_success(source, candidate, content_hash, score, dc_post_keys)
+                        else:
+                            _record_session(source, candidate["key"], content_hash, output=True)
+                            for item_key in dc_post_keys:
+                                _record_session(source, item_key)
+                            if dc_post_keys:
+                                with SESSION_LOCK:
+                                    LAST_DC_OUTPUT_POSTS[(source_url, title_filter)] = candidate["page_url"]
+                            if record_history:
+                                _record_candidate(source, candidate, "accepted", content_hash, score)
                     output_candidate = {
                         key: value for key, value in candidate.items()
                         if key not in ("frame_bytes", "_analysis", "_content_hash")
@@ -2345,14 +2649,17 @@ class JHAutoImageFeed:
                         _record_candidate(source, candidate, "download_failed")
                 continue
             if not candidate_accepted:
-                _record_session(source, candidate["key"], last_hash)
+                _record_session(source, candidate["key"])
                 if record_history:
                     _record_candidate(source, candidate, "rejected", last_hash, last_score)
         if accepted_outputs[0]:
             for candidate, content_hash, score in accepted_records:
-                _record_session(source, candidate["key"], content_hash, output=True)
-                if record_history:
-                    _record_candidate(source, candidate, "accepted", content_hash, score)
+                if defer_history:
+                    _stage_candidate_until_success(source, candidate, content_hash, score)
+                else:
+                    _record_session(source, candidate["key"], content_hash, output=True)
+                    if record_history:
+                        _record_candidate(source, candidate, "accepted", content_hash, score)
             _send_auto_feed_status(unique_id, f"Accepted {len(accepted_outputs[0])} images from the URL.")
             return accepted_outputs
         if not candidates:
@@ -2366,7 +2673,7 @@ class JHAutoImageFeed:
             if source == "Arca.live Channel":
                 raise RuntimeError(f"Arca.live pages were exhausted or no unseen posts matched the filters. Last {last_scan_status or 'page scan found no posts'}.")
             raise RuntimeError(f"The source was exhausted: no more unseen candidates could be loaded. Last {last_scan_status or 'scan found no media'}.")
-        if source not in ("DCInside Gallery", "Arca.live Channel"):
+        if source not in (LOCAL_DIRECTORY_SOURCE, "DCInside Gallery", "Arca.live Channel"):
             with SESSION_LOCK:
                 SOURCE_SCROLL_DEPTH[depth_key] = scroll_depth + scroll_step
         summary = ", ".join(f"{name.replace('_', ' ')} {count}" for name, count in rejected.items() if count)
@@ -2376,3 +2683,6 @@ class JHAutoImageFeed:
             raise error
         _send_auto_feed_status(unique_id, f"Batch exhausted ({summary or 'no usable frames'}). Loading another batch...")
         raise _ContinueSourceSearch(summary or "no usable frames")
+
+
+_install_history_completion_hook()

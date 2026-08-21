@@ -28,6 +28,7 @@ import hashlib
 import secrets
 from aiohttp import web
 from comfy_api.latest import io as comfy_io
+from comfy_execution.graph_utils import ExecutionBlocker
 from server import PromptServer
 from nodes import LoraLoader, PreviewImage
 from .auto_image_feed import JHAutoImageFeed, JHBrowserSessionSetup, delete_auto_feed_preset, get_auto_feed_presets, stop_active_crawlers, translate_to_english, translate_to_korean
@@ -45,6 +46,9 @@ JH_LLAMA_PROMPT_CACHE_LIMIT = 512
 JH_NAS_PREVIEW_PATHS = {}
 JH_NAS_PREVIEW_LOCK = threading.Lock()
 JH_NAS_PREVIEW_LIMIT = 256
+JH_LOCAL_VIDEO_PATHS = {}
+JH_LOCAL_VIDEO_LOCK = threading.Lock()
+JH_LOCAL_VIDEO_LIMIT = 128
 
 
 def _register_nas_preview(path):
@@ -53,6 +57,15 @@ def _register_nas_preview(path):
         JH_NAS_PREVIEW_PATHS[token] = os.path.abspath(path)
         while len(JH_NAS_PREVIEW_PATHS) > JH_NAS_PREVIEW_LIMIT:
             JH_NAS_PREVIEW_PATHS.pop(next(iter(JH_NAS_PREVIEW_PATHS)))
+    return token
+
+
+def _register_local_video(path):
+    token = secrets.token_urlsafe(24)
+    with JH_LOCAL_VIDEO_LOCK:
+        JH_LOCAL_VIDEO_PATHS[token] = os.path.abspath(path)
+        while len(JH_LOCAL_VIDEO_PATHS) > JH_LOCAL_VIDEO_LIMIT:
+            JH_LOCAL_VIDEO_PATHS.pop(next(iter(JH_LOCAL_VIDEO_PATHS)))
     return token
 
 
@@ -93,6 +106,79 @@ def _embed_video_metadata(path, prompt, extra_pnginfo):
     finally:
         if os.path.exists(metadata_path):
             os.remove(metadata_path)
+
+
+def _encode_nvenc_video(path, images, fps, codec, crf):
+    """Encode with system FFmpeg because imageio's bundled binary has no NVENC."""
+    ffmpeg_exe = shutil.which("ffmpeg")
+    if not ffmpeg_exe:
+        raise RuntimeError(
+            f"{codec} requires a system FFmpeg build with NVIDIA NVENC support, but ffmpeg was not found in PATH."
+        )
+
+    frames = iter(images)
+    try:
+        first_frame = next(frames)
+    except StopIteration as error:
+        raise ValueError("Cannot encode a video with no frames.") from error
+
+    def frame_array(image):
+        frame = image.detach().mul(255).clamp(0, 255).to(device="cpu", dtype=torch.uint8).numpy()
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError(f"NVENC expects RGB frames, received shape {frame.shape}.")
+        return np.ascontiguousarray(frame)
+
+    first_array = frame_array(first_frame)
+    height, width = first_array.shape[:2]
+    command = [
+        ffmpeg_exe, "-y", "-v", "error",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-video_size", f"{width}x{height}", "-framerate", str(fps),
+        "-i", "-", "-an", "-c:v", codec,
+        "-pix_fmt", "yuv420p", "-cq:v", str(crf),
+        "-preset", "p6", "-rc", "vbr",
+    ]
+    if codec == "hevc_nvenc":
+        command.extend(["-tag:v", "hvc1"])
+    command.extend(["-movflags", "+faststart", path])
+
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    write_error = None
+    try:
+        process.stdin.write(first_array.tobytes())
+        for image in frames:
+            frame = frame_array(image)
+            if frame.shape != first_array.shape:
+                raise ValueError(
+                    f"All video frames must have the same shape; expected {first_array.shape}, received {frame.shape}."
+                )
+            process.stdin.write(frame.tobytes())
+    except BrokenPipeError as error:
+        write_error = error
+    except Exception:
+        process.kill()
+        process.wait()
+        process.stderr.close()
+        raise
+    finally:
+        if process.stdin and not process.stdin.closed:
+            try:
+                process.stdin.close()
+            except BrokenPipeError as error:
+                write_error = error
+
+    error_output = process.stderr.read().decode("utf-8", errors="replace").strip()
+    process.stderr.close()
+    return_code = process.wait()
+
+    if write_error is not None or return_code != 0:
+        detail = error_output or f"FFmpeg exited with status {return_code}."
+        raise RuntimeError(f"{codec} encoding failed: {detail}")
 
 
 def _load_llama_prompt_cache():
@@ -343,6 +429,42 @@ async def get_jh_video_info(request):
         })
     except (av.error.FFmpegError, IndexError, OSError, ValueError) as error:
         return web.json_response({"error": str(error)}, status=400)
+
+
+@PromptServer.instance.routes.post("/jh/local-video/resolve")
+async def resolve_jh_local_video(request):
+    try:
+        data = await request.json()
+        raw_path = str(data.get("path") or "").strip().strip('"')
+        video_path = os.path.normpath(os.path.expanduser(os.path.expandvars(raw_path)))
+        if not raw_path or not os.path.isabs(video_path):
+            raise ValueError("Enter an absolute local video path.")
+        if not os.path.isfile(video_path):
+            raise ValueError(f"Video file not found: {video_path}")
+        with av.open(video_path, mode="r") as container:
+            stream = container.streams.video[0]
+            frame_rate = stream.average_rate or stream.guessed_rate or 1
+            duration = float(stream.duration * stream.time_base) if stream.duration is not None else float(container.duration or 0) / av.time_base
+            frame_count = int(stream.frames or round(duration * float(frame_rate)))
+        token = _register_local_video(video_path)
+        return web.json_response({
+            "token": token,
+            "fps": float(frame_rate),
+            "frame_count": frame_count,
+            "duration": duration,
+        })
+    except (av.error.FFmpegError, IndexError, OSError, ValueError, json.JSONDecodeError) as error:
+        return web.json_response({"error": str(error)}, status=400)
+
+
+@PromptServer.instance.routes.get("/jh/local-video/view")
+async def view_jh_local_video(request):
+    token = request.query.get("token", "")
+    with JH_LOCAL_VIDEO_LOCK:
+        video_path = JH_LOCAL_VIDEO_PATHS.get(token)
+    if not video_path or not os.path.isfile(video_path):
+        raise web.HTTPNotFound()
+    return web.FileResponse(video_path, headers={"Content-Disposition": "inline", "Cache-Control": "no-store"})
 
 
 @PromptServer.instance.routes.get("/jh/nas-preview")
@@ -690,24 +812,57 @@ def _parse_rgb_color(color_text, default=(255, 255, 255)):
     return default
 
 
+_JH_KOREAN_FONT_SUPPORT_CACHE = {}
+
+
+def _font_supports_korean(font_path):
+    supported = _JH_KOREAN_FONT_SUPPORT_CACHE.get(font_path)
+    if supported is not None:
+        return supported
+    try:
+        from fontTools.ttLib import TTFont
+        with TTFont(font_path, fontNumber=0, lazy=True) as font:
+            cmap = font.getBestCmap()
+            supported = bool(cmap and 0xAC00 in cmap)
+    except ImportError:
+        supported = True
+    except Exception:
+        supported = False
+    _JH_KOREAN_FONT_SUPPORT_CACHE[font_path] = supported
+    return supported
+
+
 def _load_font(font_size, font_path=""):
     try:
         if font_path and os.path.isfile(font_path):
             return ImageFont.truetype(font_path, font_size)
         windows_fonts = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")
+        linux_fonts = [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttf",
+            "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+            "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        ]
         for candidate in [
+            *linux_fonts,
             os.path.join(windows_fonts, "malgun.ttf"),
             os.path.join(windows_fonts, "malgunbd.ttf"),
             "malgun.ttf",
             "malgunbd.ttf",
-            "arial.ttf",
-            "DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         ]:
             try:
-                return ImageFont.truetype(candidate, font_size)
-            except:
-                pass
-    except:
+                font = ImageFont.truetype(candidate, font_size)
+            except Exception:
+                continue
+            if _font_supports_korean(candidate):
+                return font
+    except Exception:
         pass
     return ImageFont.load_default()
 
@@ -1141,13 +1296,11 @@ class SaveVideoToNAS:
         temp_audio_path = os.path.join(temp_dir, f"temp_a_{safe_name}.wav")
         temp_final_path = os.path.join(temp_dir, f"temp_final_{safe_name}")
 
-        frames = []
-        for img in images:
-            i = 255. * img.cpu().numpy()
-            frames.append(np.clip(i, 0, 255).astype(np.uint8))
-
         try:
             print(f"[NAS Video] Encoding...", flush=True)
+
+            def frame_array(img):
+                return img.detach().mul(255).clamp(0, 255).to(device="cpu", dtype=torch.uint8).numpy()
             
             # --- FFMPEG / ImageIO 인코딩 (기존 동일) ---
             if format == 'mp4':
@@ -1166,11 +1319,16 @@ class SaveVideoToNAS:
                     target_codec = 'libx264'
                     ffmpeg_params = ['-crf', str(crf), '-preset', 'medium']
 
-                imageio.mimsave(temp_video_path, frames, fps=fps, codec=target_codec, pixelformat='yuv420p', ffmpeg_params=ffmpeg_params)
+                if target_codec in {"h264_nvenc", "hevc_nvenc"}:
+                    _encode_nvenc_video(temp_video_path, images, fps, target_codec, crf)
+                else:
+                    with imageio.get_writer(temp_video_path, fps=fps, codec=target_codec, pixelformat='yuv420p', ffmpeg_params=ffmpeg_params) as writer:
+                        for img in images:
+                            writer.append_data(frame_array(img))
             elif format == 'gif':
-                imageio.mimsave(temp_final_path, frames, duration=(1000.0/fps), loop=0)
+                imageio.mimsave(temp_final_path, [frame_array(img) for img in images], duration=(1000.0/fps), loop=0)
             elif format == 'webp':
-                imageio.mimsave(temp_final_path, frames, fps=fps, quality=85)
+                imageio.mimsave(temp_final_path, [frame_array(img) for img in images], fps=fps, quality=85)
             
             if format == 'mp4':
                 has_audio = False
@@ -1226,7 +1384,13 @@ class SaveVideoToNAS:
             if saved_to_nas and not nas_is_local_file:
                 output_preview_available = _replace_with_symlink(local_full_path, nas_full_path)
 
-            if output_preview_available:
+            if format == "mp4":
+                ui_results.append({
+                    "token": _register_nas_preview(preview_path),
+                    "filename": file_name,
+                    "format": format
+                })
+            elif output_preview_available:
                 standard_ui_results.append({
                     "filename": file_name,
                     "subfolder": local_subfolder,
@@ -1242,6 +1406,7 @@ class SaveVideoToNAS:
 
         except Exception as e:
             print(f"[NAS Video] Error: {e}", flush=True)
+            raise RuntimeError(f"JH Save Video to NAS failed: {e}") from e
         finally:
             for p in [temp_video_path, temp_audio_path, temp_final_path]:
                 if os.path.exists(p):
@@ -1507,6 +1672,16 @@ class LoadImageFromPath:
             try:
                 from PIL import ImageGrab
                 clipboard_img = ImageGrab.grabclipboard()
+                if not clipboard_img and os.name != "nt" and shutil.which("xclip"):
+                    try:
+                        png = subprocess.run(
+                            ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+                            capture_output=True, timeout=5,
+                        )
+                        if png.returncode == 0 and png.stdout:
+                            clipboard_img = Image.open(io.BytesIO(png.stdout))
+                    except Exception:
+                        clipboard_img = None
                 if clipboard_img:
                     # 클립보드에 이미지가 있으면 사용
                     if isinstance(clipboard_img, Image.Image):
@@ -1826,6 +2001,27 @@ def _store_workflow_node_property(extra_pnginfo, unique_id, name, value):
             return
 
 
+def _get_workflow_node_property(extra_pnginfo, unique_id, name, default=None):
+    if not isinstance(extra_pnginfo, dict) or unique_id is None:
+        return default
+    workflow = extra_pnginfo.get("workflow")
+    if not isinstance(workflow, dict):
+        return default
+    node_ids = {str(unique_id), str(unique_id).rsplit(":", 1)[-1]}
+    node_lists = [workflow.get("nodes", [])]
+    definitions = workflow.get("definitions")
+    subgraphs = definitions.get("subgraphs", []) if isinstance(definitions, dict) else []
+    node_lists.extend(subgraph.get("nodes", []) for subgraph in subgraphs if isinstance(subgraph, dict))
+    for nodes in node_lists:
+        if not isinstance(nodes, list):
+            continue
+        node = next((item for item in nodes if isinstance(item, dict) and str(item.get("id")) in node_ids), None)
+        properties = node.get("properties") if isinstance(node, dict) else None
+        if isinstance(properties, dict):
+            return properties.get(name, default)
+    return default
+
+
 class JHClipboardText:
     def __init__(self):
         pass
@@ -1839,6 +2035,12 @@ class JHClipboardText:
             "optional": {
                 "clipboard_override": ("STRING", {"default": ""}),
                 "display_text": ("STRING", {"default": "", "multiline": True}),
+                "translation_provider": (["Papago", "Google"], {"default": "Papago"}),
+                "translate_en": ("BOOLEAN", {"default": False}),
+                "translate_kr": ("BOOLEAN", {"default": False}),
+                "display_translated_text": ("STRING", {"default": "", "multiline": True}),
+                "manual_text": ("STRING", {"default": "", "multiline": True}),
+                "use_manual_text": ("BOOLEAN", {"default": False}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -1846,22 +2048,47 @@ class JHClipboardText:
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("text",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("text", "translated_text")
     FUNCTION = "get_text"
     CATEGORY = JH_UTILS_CATEGORY
 
-    def get_text(self, text="", clipboard_override="", display_text="", unique_id=None, extra_pnginfo=None):
-        output = text
+    def get_text(self, text="", clipboard_override="", display_text="", translation_provider="Papago", translate_en=False, translate_kr=False, display_translated_text="", manual_text="", use_manual_text=False, unique_id=None, extra_pnginfo=None):
+        original_text = manual_text if use_manual_text else text
         if clipboard_override:
             try:
                 override = json.loads(clipboard_override)
             except (json.JSONDecodeError, TypeError):
                 override = None
             if isinstance(override, dict) and override.get("force") is True and isinstance(override.get("text"), str):
-                output = override["text"]
-        _store_workflow_node_property(extra_pnginfo, unique_id, "jh_clipboard_output", output)
-        return {"ui": {"text": [output]}, "result": (output,)}
+                original_text = override["text"]
+        translated_text = ""
+        target_language = "ko" if translate_kr else ("en" if translate_en else "")
+        translation_cache_key = ""
+        if target_language:
+            cache_source = f"{translation_provider}\0{target_language}\0{original_text}".encode("utf-8")
+            translation_cache_key = hashlib.sha256(cache_source).hexdigest()
+            previous_cache_key = _get_workflow_node_property(
+                extra_pnginfo, unique_id, "jh_clipboard_translation_cache_key", ""
+            )
+            if previous_cache_key == translation_cache_key and display_translated_text:
+                translated_text = display_translated_text
+            elif target_language == "ko":
+                translated_text = translate_to_korean(translation_provider, original_text)
+            else:
+                translated_text = translate_to_english(translation_provider, original_text)
+        _store_workflow_node_property(extra_pnginfo, unique_id, "jh_clipboard_output", original_text)
+        _store_workflow_node_property(extra_pnginfo, unique_id, "jh_clipboard_translated_output", translated_text)
+        _store_workflow_node_property(extra_pnginfo, unique_id, "jh_clipboard_translation_cache_key", translation_cache_key)
+        return {
+            "ui": {
+                "text": [original_text],
+                "original_text": [original_text],
+                "translated_text": [translated_text],
+                "translation_cache_key": [translation_cache_key],
+            },
+            "result": (original_text, translated_text),
+        }
 
 
 class JHPromptBuilder(comfy_io.ComfyNode):
@@ -1888,13 +2115,15 @@ class JHPromptBuilder(comfy_io.ComfyNode):
                 comfy_io.Combo.Input("translation_provider", display_name="Translation", options=["Papago", "Google"], default="Papago"),
                 comfy_io.Boolean.Input("base_enabled", default=True, socketless=True),
                 comfy_io.String.Input("input_prompt_enabled", default="{}", socketless=True),
+                comfy_io.Boolean.Input("base_translate_kr", default=False, socketless=True),
+                comfy_io.String.Input("input_prompt_translations_kr", default="{}", socketless=True),
                 comfy_io.Autogrow.Input("input_prompts", template=input_template, optional=True),
             ],
             outputs=[comfy_io.String.Output("prompt")],
         )
 
     @classmethod
-    def execute(cls, base_prompt="", prompt_slots="[]", base_position=0, prompt_order="[]", base_strength=1.0, input_prompt_strengths="{}", base_translate=False, input_prompt_translations="{}", translation_provider="Papago", base_enabled=True, input_prompt_enabled="{}", input_prompts=None):
+    def execute(cls, base_prompt="", prompt_slots="[]", base_position=0, prompt_order="[]", base_strength=1.0, input_prompt_strengths="{}", base_translate=False, input_prompt_translations="{}", base_translate_kr=False, input_prompt_translations_kr="{}", translation_provider="Papago", base_enabled=True, input_prompt_enabled="{}", input_prompts=None):
         try:
             slots = json.loads(prompt_slots) if isinstance(prompt_slots, str) else prompt_slots
         except json.JSONDecodeError as error:
@@ -1911,7 +2140,9 @@ class JHPromptBuilder(comfy_io.ComfyNode):
             if not slot.get("enabled", True) or not prompt.strip():
                 prompt = ""
             else:
-                if slot.get("translate", False):
+                if slot.get("translate_kr", False):
+                    prompt = translate_to_korean(translation_provider, prompt)
+                elif slot.get("translate", False):
                     prompt = translate_to_english(translation_provider, prompt)
                 strength = float(slot.get("strength", 1.0))
                 prompt = prompt if strength == 1.0 else f"({prompt}:{strength:.6g})"
@@ -1932,6 +2163,12 @@ class JHPromptBuilder(comfy_io.ComfyNode):
         if not isinstance(input_translations, dict):
             raise ValueError("Input prompt translations have an invalid format")
         try:
+            input_translations_kr = json.loads(input_prompt_translations_kr) if isinstance(input_prompt_translations_kr, str) else input_prompt_translations_kr
+        except json.JSONDecodeError as error:
+            raise ValueError("Input prompt Korean translations have an invalid format") from error
+        if not isinstance(input_translations_kr, dict):
+            raise ValueError("Input prompt Korean translations have an invalid format")
+        try:
             input_enabled = json.loads(input_prompt_enabled) if isinstance(input_prompt_enabled, str) else input_prompt_enabled
         except json.JSONDecodeError as error:
             raise ValueError("Input prompt enabled states have an invalid format") from error
@@ -1942,14 +2179,16 @@ class JHPromptBuilder(comfy_io.ComfyNode):
             strength = float(strength)
             return prompt if strength == 1.0 else f"({prompt}:{strength:.6g})"
 
-        def translate_prompt(prompt, enabled):
-            return translate_to_english(translation_provider, prompt) if enabled else prompt
+        def translate_prompt(prompt, translate_en, translate_kr):
+            if translate_kr:
+                return translate_to_korean(translation_provider, prompt)
+            return translate_to_english(translation_provider, prompt) if translate_en else prompt
 
         input_prompts = input_prompts or {}
         input_order = sorted(input_prompts, key=lambda name: int(name.rsplit("input_prompt", 1)[-1]))
-        values = {"base": apply_strength(translate_prompt(base_prompt, base_translate), base_strength) if base_enabled and base_prompt.strip() else ""}
+        values = {"base": apply_strength(translate_prompt(base_prompt, base_translate, base_translate_kr), base_strength) if base_enabled and base_prompt.strip() else ""}
         values.update(slot_prompts)
-        values.update({f"input:{name}": apply_strength(translate_prompt(value, input_translations.get(name, False)), input_strengths.get(name, 1.0)) for name, value in input_prompts.items() if input_enabled.get(name, True) and isinstance(value, str) and value.strip()})
+        values.update({f"input:{name}": apply_strength(translate_prompt(value, input_translations.get(name, False), input_translations_kr.get(name, False)), input_strengths.get(name, 1.0)) for name, value in input_prompts.items() if input_enabled.get(name, True) and isinstance(value, str) and value.strip()})
 
         try:
             order = json.loads(prompt_order) if isinstance(prompt_order, str) else prompt_order
@@ -2150,7 +2389,7 @@ class JHLlamaPrompt:
                 "enable_vision": ("BOOLEAN", {"default": False}),
                 "vision_max_size": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 64}),
                 "video_frames": ("INT", {"default": 4, "min": 1, "max": 16}),
-                "server_url": ("STRING", {"default": "http://127.0.0.1:8080"}),
+                "server_url": ("STRING", {"default": "http://127.0.0.1:8082"}),
                 "model": ("STRING", {"default": "auto"}),
                 "max_tokens": ("INT", {"default": 768, "min": 1, "max": 8192}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05}),
@@ -2220,6 +2459,28 @@ class JHLlamaPrompt:
         if not models:
             raise RuntimeError("llama.cpp returned no loaded models")
         return models[0].get("id") or models[0].get("model") or models[0].get("name")
+
+    def _wait_for_vram_handoff(self, server_url, timeout):
+        """Wait until the managed llama backend has finished its idle unload.
+
+        The completion response can arrive before llama.cpp's idle-sleep thread
+        releases CUDA allocations.  Starting the next ComfyUI model load in
+        that window fills the card even though PyTorch itself owns almost no
+        memory.
+        """
+        parsed = urllib.parse.urlparse(server_url)
+        if parsed.hostname not in {"127.0.0.1", "localhost", "::1"} or parsed.port != 8082:
+            return
+        guard_host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+        guard_url = parsed._replace(
+            netloc=f"{guard_host}:8080",
+            path="/__vram_guard/wait-backend-release",
+            query=urllib.parse.urlencode({"timeout": min(120, max(10, timeout))}),
+            fragment="",
+        ).geturl()
+        response = self._request_json(guard_url, timeout=min(125, max(15, timeout + 5)))
+        if response.get("released") is not True:
+            raise RuntimeError(f"llama.cpp VRAM handoff failed: {response}")
 
     def _pil_image_content(self, pil_image, max_size):
         pil_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
@@ -2445,6 +2706,13 @@ class JHLlamaPrompt:
     def create_prompt(self, prompt, mode, instruction, enable_vision, vision_max_size, video_frames, server_url, model, max_tokens, temperature, seed, timeout, display_text="", display_lora_info="", character_sheet_mode="Normal", curvy_mode=False, glamorous_mode=False, huge_breasts_mode=False, character_identity="LoRA / model", identity_trigger="", curvy_strength=1.0, glamorous_strength=1.0, huge_breasts_strength=1.0, reuse_identical_image=False, supplemental_prompt="", supplemental_position="After base prompt", translation_provider="Papago", translate_prompt=False, translate_instruction=False, translate_supplemental=False, image=None, video=None, lora_info=None, unique_id=None, extra_pnginfo=None):
         server_url = server_url.rstrip("/")
         parsed_url = urllib.parse.urlparse(server_url)
+        # 8080 is the human-facing VRAM guard. A ComfyUI node calling it would
+        # wait for its own running queue forever, so migrate old workflows to
+        # the direct llama backend automatically.
+        if parsed_url.hostname in {"127.0.0.1", "localhost", "::1"} and parsed_url.port == 8080:
+            direct_host = f"[{parsed_url.hostname}]" if ":" in parsed_url.hostname else parsed_url.hostname
+            server_url = parsed_url._replace(netloc=f"{direct_host}:8082").geturl()
+            parsed_url = urllib.parse.urlparse(server_url)
         if parsed_url.scheme != "http" or parsed_url.hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("server_url must point to a local llama.cpp HTTP server")
         if enable_vision and image is None and video is None:
@@ -2550,6 +2818,9 @@ class JHLlamaPrompt:
                         print(f"[JH llama.cpp Prompt] Could not write prompt cache: {error}")
             results[sheet_mode] = text
 
+        if models_unloaded:
+            self._wait_for_vram_handoff(server_url, timeout)
+
         if cache_hit:
             self._send_cache_hit(unique_id)
         normal_prompt = results.get(False, "")
@@ -2615,13 +2886,20 @@ class JHPriorityPassthrough(comfy_io.ComfyNode):
             bypassed = set()
         available = [(name, value) for name, value in inputs.items() if name not in bypassed]
         if not available:
-            raise ValueError("Connect at least one input.")
+            names = list(inputs) or sorted(bypassed)
+            info = [f"{name}: bypassed (blocked)" for name in names]
+            if not info:
+                info = ["No available input (blocked)"]
+            return comfy_io.NodeOutput(ExecutionBlocker(None), ui={"priority_info": info})
         if selected_input:
             selected_name = f"input{selected_input}"
+            if selected_name in bypassed:
+                info = [f"{name}: bypassed (blocked)" if name == selected_name else f"{name}: {cls._format_value(value)}" for name, value in inputs.items()]
+                if selected_name not in inputs:
+                    info.append(f"{selected_name}: bypassed (blocked)")
+                return comfy_io.NodeOutput(ExecutionBlocker(None), ui={"priority_info": info})
             if selected_name not in inputs:
                 raise ValueError(f"Selected {selected_name} is not connected.")
-            if selected_name in bypassed:
-                raise ValueError(f"Selected {selected_name} is bypassed.")
             output = inputs[selected_name]
         else:
             selected_name, output = random.choice(available) if random_mode else available[0]

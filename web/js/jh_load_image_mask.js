@@ -65,6 +65,7 @@ async function normalizeImageBlobToPng(blob) {
 }
 
 async function readClipboardImage() {
+    if (!window.isSecureContext || !navigator.clipboard?.read) return null;
     for (const item of await navigator.clipboard.read()) {
         const type = item.types.find((candidate) => candidate.startsWith("image/"));
         if (type) return item.getType(type);
@@ -94,7 +95,45 @@ async function copyImageValue(value) {
     const response = await fetch(api.apiURL(`/view?${params}`), { cache: "no-store" });
     if (!response.ok) throw new Error(`Image fetch failed: ${response.status}`);
     const png = await normalizeImageBlobToPng(await response.blob());
-    await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
+    if (window.isSecureContext && navigator.clipboard?.write && window.ClipboardItem) {
+        try {
+            await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
+            return;
+        } catch (error) {
+            // fall through to the execCommand path
+        }
+    }
+    if (copyImageViaExecCommand(png)) return;
+    throw new Error("Clipboard image copy needs a secure context. Open this UI via http://localhost:8188 (a LAN IP is not enough).");
+}
+
+function copyImageViaExecCommand(blob) {
+    const url = URL.createObjectURL(blob);
+    try {
+        const image = document.createElement("img");
+        image.src = url;
+        image.style.position = "fixed";
+        image.style.left = "-9999px";
+        image.style.top = "0";
+        image.style.opacity = "0";
+        document.body.appendChild(image);
+        const range = document.createRange();
+        range.selectNodeContents(image);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        let copied = false;
+        try {
+            copied = document.execCommand("copy");
+        } catch (error) {
+            copied = false;
+        }
+        selection.removeAllRanges();
+        image.remove();
+        return copied;
+    } finally {
+        URL.revokeObjectURL(url);
+    }
 }
 
 function makeImageClipboardActions(onPaste, onPasteAndRun, onCopy) {
@@ -370,6 +409,7 @@ app.registerExtension({
             const result = onNodeCreated?.apply(this, arguments);
             const node = this;
             const imageWidget = node.widgets.find((widget) => widget.name === (isVideo ? "video" : "image"));
+            const localPathWidget = isVideo ? node.widgets.find((widget) => widget.name === "local_path") : null;
             const configWidget = node.widgets.find((widget) => widget.name === "slot_config");
             const megapixelsWidget = node.widgets.find((widget) => widget.name === "max_megapixels");
             const selectionWidget = node.widgets.find((widget) => widget.name === "selection_mode");
@@ -385,6 +425,11 @@ app.registerExtension({
 
             Object.defineProperty(node, "imgs", { get: () => undefined, set: () => {} });
             if (isVideo) {
+                localPathWidget.label = "local video path";
+                localPathWidget.options = {
+                    ...(localPathWidget.options || {}),
+                    placeholder: "C:\\Videos\\example.mp4",
+                };
                 Object.defineProperty(node, "videos", { get: () => undefined, set: () => {} });
                 const addDOMWidget = node.addDOMWidget.bind(node);
                 node.addDOMWidget = function (name) {
@@ -456,7 +501,7 @@ app.registerExtension({
                         toast("success", "Clipboard", "Image copied.");
                     } catch (error) {
                         console.error("[JH Load Image & Mask] Clipboard copy failed:", error);
-                        toast("warn", "Clipboard", imageWidget.value ? "Image could not be copied." : "There is no image to copy.");
+                        toast("warn", "Clipboard", imageWidget.value ? (error.message || "Image could not be copied.") : "There is no image to copy.");
                     }
                 };
                 clipboardActions = node.addCustomWidget(makeImageClipboardActions(pasteImage, pasteAndRun, copyImage));
@@ -521,11 +566,13 @@ app.registerExtension({
                 node.properties = node.properties || {};
                 node.properties.jh_load_image_mask_slots = configWidget.value;
                 node.properties.jh_load_image_mask_image = String(imageWidget.value || "");
+                if (localPathWidget) node.properties.jh_load_video_local_path = String(localPathWidget.value || "");
                 const maxMegapixels = Number(megapixelsWidget.value);
                 node.properties.jh_load_image_mask_max_megapixels = Number.isFinite(maxMegapixels) ? maxMegapixels : 0;
                 node.properties.jh_load_image_mask_selection_mode = selectionWidget.value;
                 node.properties.jh_load_image_mask_model = String(modelWidget.value || "");
                 persistWidgetValue(imageWidget, imageWidget.value);
+                if (localPathWidget) persistWidgetValue(localPathWidget, localPathWidget.value);
                 persistWidgetValue(configWidget, configWidget.value);
                 persistWidgetValue(megapixelsWidget, node.properties.jh_load_image_mask_max_megapixels);
                 persistWidgetValue(selectionWidget, selectionWidget.value);
@@ -1314,11 +1361,36 @@ app.registerExtension({
                 video.requestVideoFrameCallback(drawFrame);
             }
 
-            function loadImage() {
+            async function loadImage() {
                 const sequence = ++loadSequence;
-                const info = parseImageValue(imageWidget.value);
-                if (!info) return;
-                const src = api.apiURL(`/view?filename=${encodeURIComponent(info.filename)}&type=${info.type}&subfolder=${encodeURIComponent(info.subfolder)}&rand=${Math.random()}`);
+                const localPath = isVideo ? String(localPathWidget?.value || "").trim() : "";
+                const info = localPath ? null : parseImageValue(imageWidget.value);
+                if (!localPath && !info) return;
+                let src = info
+                    ? api.apiURL(`/view?filename=${encodeURIComponent(info.filename)}&type=${info.type}&subfolder=${encodeURIComponent(info.subfolder)}&rand=${Math.random()}`)
+                    : "";
+                let localVideoInfo = null;
+                if (localPath) {
+                    try {
+                        const response = await api.fetchApi("/jh/local-video/resolve", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ path: localPath }),
+                        });
+                        const data = await response.json();
+                        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+                        if (sequence !== loadSequence) return;
+                        localVideoInfo = data;
+                        src = api.apiURL(`/jh/local-video/view?token=${encodeURIComponent(data.token)}`);
+                    } catch (error) {
+                        if (sequence !== loadSequence) return;
+                        console.error("[JH Load Video & Mask] Local video load failed:", error);
+                        state.img = null;
+                        toast("warn", "Local video", error.message || "The local video could not be loaded.");
+                        redrawEditor();
+                        return;
+                    }
+                }
                 if (isVideo) {
                     if (state.video) {
                         state.video.pause();
@@ -1354,7 +1426,14 @@ app.registerExtension({
                     video.preload = "auto";
                     video.playsInline = true;
                     state.video = video;
-                    loadVideoInfo(imageWidget.value, sequence);
+                    if (localVideoInfo) {
+                        state.sourceFps = Number(localVideoInfo.fps) || 0;
+                        state.sourceFrameCount = Number(localVideoInfo.frame_count) || 0;
+                        state.sourceDuration = Number(localVideoInfo.duration) || 0;
+                        updateVideoRange(true);
+                    } else {
+                        loadVideoInfo(imageWidget.value, sequence);
+                    }
                     video.onloadeddata = () => {
                         if (sequence !== loadSequence) return;
                         state.img = video;
@@ -1404,11 +1483,27 @@ app.registerExtension({
             const imageCallback = imageWidget.callback;
             imageWidget.callback = function () {
                 const callbackResult = imageCallback?.apply(this, arguments);
+                if (localPathWidget?.value) {
+                    localPathWidget.value = "";
+                    persistWidgetValue(localPathWidget, "");
+                }
                 for (const slot of state.slots) slot.rect = null;
                 syncConfig();
                 loadImage();
                 return callbackResult;
             };
+
+            if (localPathWidget) {
+                const localPathCallback = localPathWidget.callback;
+                localPathWidget.callback = function (value) {
+                    const callbackResult = localPathCallback?.apply(this, arguments);
+                    localPathWidget.value = String(value || "").trim().replace(/^"|"$/g, "");
+                    for (const slot of state.slots) slot.rect = null;
+                    syncConfig();
+                    loadImage();
+                    return callbackResult;
+                };
+            }
 
             const megapixelsCallback = megapixelsWidget.callback;
             megapixelsWidget.callback = function (value) {
@@ -1448,6 +1543,7 @@ app.registerExtension({
             node.onConfigure = function (info) {
                 const configuredValues = Array.isArray(info?.widgets_values) ? [...info.widgets_values] : null;
                 const configuredImageProperty = info?.properties?.jh_load_image_mask_image;
+                const configuredLocalPathProperty = info?.properties?.jh_load_video_local_path;
                 const configuredProperty = info?.properties?.jh_load_image_mask_slots;
                 const configuredMaxProperty = Number(info?.properties?.jh_load_image_mask_max_megapixels);
                 const configuredSelectionProperty = info?.properties?.jh_load_image_mask_selection_mode;
@@ -1461,6 +1557,16 @@ app.registerExtension({
                     ? configuredImageProperty
                     : configuredImageValue;
                 if (restoredImage) imageWidget.value = restoredImage;
+                if (localPathWidget) {
+                    const localPathIndex = node.widgets.findIndex((widget) => widget.name === "local_path");
+                    const serializedLocalPath = localPathIndex >= 0 ? configuredValues?.[localPathIndex] : "";
+                    const configuredLocalPathValue = typeof serializedLocalPath === "string" && /^(?:[a-zA-Z]:[\\/]|\\\\|\/)/.test(serializedLocalPath)
+                        ? serializedLocalPath
+                        : "";
+                    localPathWidget.value = typeof configuredLocalPathProperty === "string"
+                        ? configuredLocalPathProperty
+                        : configuredLocalPathValue;
+                }
                 let restored = typeof configuredProperty === "string" ? configuredProperty : null;
                 if (!restored && Array.isArray(configuredValues)) {
                     restored = configuredValues.find((value) => {
@@ -1521,6 +1627,7 @@ app.registerExtension({
                 const serializeResult = onSerialize?.apply(this, arguments);
                 info.properties = info.properties || {};
                 info.properties.jh_load_image_mask_image = String(imageWidget.value || "");
+                if (localPathWidget) info.properties.jh_load_video_local_path = String(localPathWidget.value || "");
                 info.properties.jh_load_image_mask_slots = configWidget.value;
                 info.properties.jh_load_image_mask_max_megapixels = Number.isFinite(Number(megapixelsWidget.value))
                     ? Number(megapixelsWidget.value)
@@ -1529,7 +1636,7 @@ app.registerExtension({
                 info.properties.jh_load_image_mask_model = String(modelWidget.value || "");
                 if (clipboardActions) info.properties.jh_load_image_mask_hotkeys = { ...clipboardActions.hotkeys };
                 info.widgets_values = Array.isArray(info.widgets_values) ? info.widgets_values : [];
-                for (const widget of [imageWidget, configWidget, megapixelsWidget, selectionWidget, modelWidget]) {
+                for (const widget of [imageWidget, localPathWidget, configWidget, megapixelsWidget, selectionWidget, modelWidget].filter(Boolean)) {
                     const index = node.widgets.findIndex((candidate) => candidate.name === widget.name);
                     if (index >= 0) info.widgets_values[index] = widget.value;
                 }

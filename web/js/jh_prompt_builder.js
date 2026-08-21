@@ -102,7 +102,8 @@ function makePromptRow(data, callbacks) {
 		value: {
 			id: typeof data.id === "string" ? data.id : Math.random().toString(36).slice(2),
 			enabled: data.enabled !== false,
-			translate: data.translate === true,
+			translate: data.translate === true && data.translate_kr !== true,
+			translate_kr: data.translate_kr === true,
 			title: typeof data.title === "string" ? data.title : "",
 			prompt: typeof data.prompt === "string" ? data.prompt : "",
 			strength: Number.isFinite(Number(data.strength)) ? Number(data.strength) : 1,
@@ -119,12 +120,13 @@ function makePromptRow(data, callbacks) {
 			this.bounds.toggle = [x + 6, y + 6, 12, 12];
 			this.bounds.up = [x + rowWidth - 116, y + 2, 20, 20];
 			this.bounds.down = [x + rowWidth - 94, y + 2, 20, 20];
-			this.bounds.translate = [x + rowWidth - 142, y + 2, 22, 20];
-			this.bounds.reset = [x + rowWidth - 166, y + 2, 22, 20];
+			this.bounds.translate = [x + rowWidth - 166, y + 2, 22, 20];
+			this.bounds.translateKr = [x + rowWidth - 142, y + 2, 22, 20];
+			this.bounds.reset = [x + rowWidth - 190, y + 2, 22, 20];
 			this.bounds.dec = [x + rowWidth - 70, y + 2, 18, 20];
 			this.bounds.strength = [x + rowWidth - 52, y + 2, 34, 20];
 			this.bounds.inc = [x + rowWidth - 18, y + 2, 18, 20];
-			this.bounds.label = [x + 24, y, rowWidth - 194, 24];
+			this.bounds.label = [x + 24, y, rowWidth - 218, 24];
 
 			ctx.save();
 			ctx.fillStyle = "#202020";
@@ -150,6 +152,8 @@ function makePromptRow(data, callbacks) {
 			ctx.fillStyle = this.value.translate ? "#7ed6a5" : "#777";
 			ctx.font = "600 9px sans-serif";
 			ctx.fillText("EN", this.bounds.translate[0] + 11, y + 12);
+			ctx.fillStyle = this.value.translate_kr ? "#7ed6a5" : "#777";
+			ctx.fillText("KR", this.bounds.translateKr[0] + 11, y + 12);
 			ctx.fillStyle = "#ddd";
 			ctx.font = "12px sans-serif";
 			ctx.fillText("\u2191", this.bounds.up[0] + 10, y + 12);
@@ -171,9 +175,14 @@ function makePromptRow(data, callbacks) {
 				this.value.enabled = !this.value.enabled;
 			} else if (contains(this.bounds.reset, pos)) {
 				this.value.translate = false;
+				this.value.translate_kr = false;
 				this.value.strength = 1;
 			} else if (contains(this.bounds.translate, pos)) {
 				this.value.translate = !this.value.translate;
+				if (this.value.translate) this.value.translate_kr = false;
+			} else if (contains(this.bounds.translateKr, pos)) {
+				this.value.translate_kr = !this.value.translate_kr;
+				if (this.value.translate_kr) this.value.translate = false;
 			} else if (contains(this.bounds.up, pos)) {
 				callbacks.move(this, -1);
 				return true;
@@ -203,12 +212,12 @@ function makePromptRow(data, callbacks) {
 	};
 }
 
-function makeBaseOrderRow(callbacks, strength = 1, translate = false, enabled = true) {
+function makeBaseOrderRow(callbacks, strength = 1, translate = false, translateKr = false, enabled = true) {
 	return {
 		type: "jh_base_prompt_row",
 		name: "jh_base_prompt_row",
 		serialize: false,
-		value: { strength, translate, enabled },
+		value: { strength, translate: translate && !translateKr, translate_kr: translateKr, enabled },
 		bounds: {},
 		computeSize(width) {
 			return [width || 0, 28];
@@ -219,8 +228,9 @@ function makeBaseOrderRow(callbacks, strength = 1, translate = false, enabled = 
 			this.bounds.toggle = [x + 6, y + 6, 12, 12];
 			this.bounds.up = [x + rowWidth - 116, y + 2, 20, 20];
 			this.bounds.down = [x + rowWidth - 94, y + 2, 20, 20];
-			this.bounds.translate = [x + rowWidth - 142, y + 2, 22, 20];
-			this.bounds.reset = [x + rowWidth - 166, y + 2, 22, 20];
+			this.bounds.translate = [x + rowWidth - 166, y + 2, 22, 20];
+			this.bounds.translateKr = [x + rowWidth - 142, y + 2, 22, 20];
+			this.bounds.reset = [x + rowWidth - 190, y + 2, 22, 20];
 			this.bounds.dec = [x + rowWidth - 70, y + 2, 18, 20];
 			this.bounds.strength = [x + rowWidth - 52, y + 2, 34, 20];
 			this.bounds.inc = [x + rowWidth - 18, y + 2, 18, 20];
@@ -249,6 +259,8 @@ function makeBaseOrderRow(callbacks, strength = 1, translate = false, enabled = 
 			ctx.fillStyle = this.value.translate ? "#7ed6a5" : "#777";
 			ctx.font = "600 9px sans-serif";
 			ctx.fillText("EN", this.bounds.translate[0] + 11, y + 12);
+			ctx.fillStyle = this.value.translate_kr ? "#7ed6a5" : "#777";
+			ctx.fillText("KR", this.bounds.translateKr[0] + 11, y + 12);
 			ctx.fillStyle = "#e4ecf7";
 			ctx.font = "12px sans-serif";
 			ctx.fillText("\u2191", this.bounds.up[0] + 10, y + 12);
@@ -270,11 +282,18 @@ function makeBaseOrderRow(callbacks, strength = 1, translate = false, enabled = 
 			else if (contains(this.bounds.down, pos)) callbacks.move(this, 1);
 			else if (contains(this.bounds.reset, pos)) {
 				this.value.translate = false;
+				this.value.translate_kr = false;
 				this.value.strength = 1;
 				callbacks.change();
 			}
 			else if (contains(this.bounds.translate, pos)) {
 				this.value.translate = !this.value.translate;
+				if (this.value.translate) this.value.translate_kr = false;
+				callbacks.change();
+			}
+			else if (contains(this.bounds.translateKr, pos)) {
+				this.value.translate_kr = !this.value.translate_kr;
+				if (this.value.translate_kr) this.value.translate = false;
 				callbacks.change();
 			}
 			else if (contains(this.bounds.dec, pos)) {
@@ -297,14 +316,14 @@ function makeBaseOrderRow(callbacks, strength = 1, translate = false, enabled = 
 	};
 }
 
-function makeInputOrderRow(name, callbacks, strength = 1, translate = false, enabled = true) {
+function makeInputOrderRow(name, callbacks, strength = 1, translate = false, translateKr = false, enabled = true) {
 	const number = name.match(/(\d+)$/)?.[1] || "";
 	return {
 		type: "jh_input_prompt_row",
 		name: `jh_input_prompt_row_${name}`,
 		inputName: name,
 		serialize: false,
-		value: { strength, translate, enabled },
+		value: { strength, translate: translate && !translateKr, translate_kr: translateKr, enabled },
 		bounds: {},
 		computeSize(width) {
 			return [width || 0, 28];
@@ -315,8 +334,9 @@ function makeInputOrderRow(name, callbacks, strength = 1, translate = false, ena
 			this.bounds.toggle = [x + 6, y + 6, 12, 12];
 			this.bounds.up = [x + rowWidth - 116, y + 2, 20, 20];
 			this.bounds.down = [x + rowWidth - 94, y + 2, 20, 20];
-			this.bounds.translate = [x + rowWidth - 142, y + 2, 22, 20];
-			this.bounds.reset = [x + rowWidth - 166, y + 2, 22, 20];
+			this.bounds.translate = [x + rowWidth - 166, y + 2, 22, 20];
+			this.bounds.translateKr = [x + rowWidth - 142, y + 2, 22, 20];
+			this.bounds.reset = [x + rowWidth - 190, y + 2, 22, 20];
 			this.bounds.dec = [x + rowWidth - 70, y + 2, 18, 20];
 			this.bounds.strength = [x + rowWidth - 52, y + 2, 34, 20];
 			this.bounds.inc = [x + rowWidth - 18, y + 2, 18, 20];
@@ -345,6 +365,8 @@ function makeInputOrderRow(name, callbacks, strength = 1, translate = false, ena
 			ctx.fillStyle = this.value.translate ? "#7ed6a5" : "#777";
 			ctx.font = "600 9px sans-serif";
 			ctx.fillText("EN", this.bounds.translate[0] + 11, y + 12);
+			ctx.fillStyle = this.value.translate_kr ? "#7ed6a5" : "#777";
+			ctx.fillText("KR", this.bounds.translateKr[0] + 11, y + 12);
 			ctx.fillStyle = "#dff5ec";
 			ctx.font = "12px sans-serif";
 			ctx.fillText("\u2191", this.bounds.up[0] + 10, y + 12);
@@ -366,11 +388,18 @@ function makeInputOrderRow(name, callbacks, strength = 1, translate = false, ena
 			else if (contains(this.bounds.down, pos)) callbacks.move(this, 1);
 			else if (contains(this.bounds.reset, pos)) {
 				this.value.translate = false;
+				this.value.translate_kr = false;
 				this.value.strength = 1;
 				callbacks.change();
 			}
 			else if (contains(this.bounds.translate, pos)) {
 				this.value.translate = !this.value.translate;
+				if (this.value.translate) this.value.translate_kr = false;
+				callbacks.change();
+			}
+			else if (contains(this.bounds.translateKr, pos)) {
+				this.value.translate_kr = !this.value.translate_kr;
+				if (this.value.translate_kr) this.value.translate = false;
 				callbacks.change();
 			}
 			else if (contains(this.bounds.dec, pos)) {
@@ -403,9 +432,11 @@ function installPromptBuilder(node) {
 	const inputStrengthsWidget = getWidget(node, "input_prompt_strengths");
 	const baseTranslateWidget = getWidget(node, "base_translate");
 	const inputTranslationsWidget = getWidget(node, "input_prompt_translations");
+	const baseTranslateKrWidget = getWidget(node, "base_translate_kr");
+	const inputTranslationsKrWidget = getWidget(node, "input_prompt_translations_kr");
 	const baseEnabledWidget = getWidget(node, "base_enabled");
 	const inputEnabledWidget = getWidget(node, "input_prompt_enabled");
-	if (!storedWidget || !basePositionWidget || !promptOrderWidget || !baseStrengthWidget || !inputStrengthsWidget || !baseTranslateWidget || !inputTranslationsWidget || !baseEnabledWidget || !inputEnabledWidget) return;
+	if (!storedWidget || !basePositionWidget || !promptOrderWidget || !baseStrengthWidget || !inputStrengthsWidget || !baseTranslateWidget || !inputTranslationsWidget || !baseTranslateKrWidget || !inputTranslationsKrWidget || !baseEnabledWidget || !inputEnabledWidget) return;
 	hideWidget(storedWidget);
 	hideWidget(basePositionWidget);
 	hideWidget(promptOrderWidget);
@@ -413,6 +444,8 @@ function installPromptBuilder(node) {
 	hideWidget(inputStrengthsWidget);
 	hideWidget(baseTranslateWidget);
 	hideWidget(inputTranslationsWidget);
+	hideWidget(baseTranslateKrWidget);
+	hideWidget(inputTranslationsKrWidget);
 	hideWidget(baseEnabledWidget);
 	hideWidget(inputEnabledWidget);
 	node.jhPromptSlots = [];
@@ -439,6 +472,9 @@ function installPromptBuilder(node) {
 		setStoredValue(node, baseTranslateWidget, baseRow.value.translate);
 		const inputTranslations = Object.fromEntries([...node.jhInputPromptRows].map(([name, row]) => [name, row.value.translate]));
 		setStoredValue(node, inputTranslationsWidget, JSON.stringify(inputTranslations));
+		setStoredValue(node, baseTranslateKrWidget, baseRow.value.translate_kr);
+		const inputTranslationsKr = Object.fromEntries([...node.jhInputPromptRows].map(([name, row]) => [name, row.value.translate_kr]));
+		setStoredValue(node, inputTranslationsKrWidget, JSON.stringify(inputTranslationsKr));
 		setStoredValue(node, baseEnabledWidget, baseRow.value.enabled);
 		const inputEnabled = Object.fromEntries([...node.jhInputPromptRows].map(([name, row]) => [name, row.value.enabled]));
 		setStoredValue(node, inputEnabledWidget, JSON.stringify(inputEnabled));
@@ -470,7 +506,7 @@ function installPromptBuilder(node) {
 	};
 	const callbacks = { change: sync, remove, move };
 	const initialBaseStrength = Number(baseStrengthWidget.value);
-	const baseRow = makeBaseOrderRow(callbacks, Number.isFinite(initialBaseStrength) ? initialBaseStrength : 1, baseTranslateWidget.value === true, baseEnabledWidget.value !== false);
+	const baseRow = makeBaseOrderRow(callbacks, Number.isFinite(initialBaseStrength) ? initialBaseStrength : 1, baseTranslateWidget.value === true, baseTranslateKrWidget.value === true, baseEnabledWidget.value !== false);
 	const getInputStrengths = () => {
 		try {
 			const strengths = JSON.parse(inputStrengthsWidget.value || "{}");
@@ -482,6 +518,14 @@ function installPromptBuilder(node) {
 	const getInputTranslations = () => {
 		try {
 			const translations = JSON.parse(inputTranslationsWidget.value || "{}");
+			return translations && typeof translations === "object" && !Array.isArray(translations) ? translations : {};
+		} catch {
+			return {};
+		}
+	};
+	const getInputTranslationsKr = () => {
+		try {
+			const translations = JSON.parse(inputTranslationsKrWidget.value || "{}");
 			return translations && typeof translations === "object" && !Array.isArray(translations) ? translations : {};
 		} catch {
 			return {};
@@ -517,6 +561,7 @@ function installPromptBuilder(node) {
 		const connectedNames = new Set();
 		const storedInputStrengths = getInputStrengths();
 		const storedInputTranslations = getInputTranslations();
+		const storedInputTranslationsKr = getInputTranslationsKr();
 		const storedInputEnabled = getInputEnabled();
 		for (const input of node.inputs || []) {
 			const inputName = input.name?.split(".").at(-1) || "";
@@ -536,12 +581,14 @@ function installPromptBuilder(node) {
 				const row = node.jhInputPromptRows.get(name);
 				if (Number.isFinite(Number(storedInputStrengths[name]))) row.value.strength = Number(storedInputStrengths[name]);
 				if (typeof storedInputTranslations[name] === "boolean") row.value.translate = storedInputTranslations[name];
+				if (typeof storedInputTranslationsKr[name] === "boolean") row.value.translate_kr = storedInputTranslationsKr[name];
+				if (row.value.translate_kr) row.value.translate = false;
 				if (typeof storedInputEnabled[name] === "boolean") row.value.enabled = storedInputEnabled[name];
 				if (!node.jhPromptItems.includes(row)) node.jhPromptItems.push(row);
 				continue;
 			}
 			const strength = Number.isFinite(Number(storedInputStrengths[name])) ? Number(storedInputStrengths[name]) : 1;
-			const row = makeInputOrderRow(name, callbacks, strength, storedInputTranslations[name] === true, storedInputEnabled[name] !== false);
+			const row = makeInputOrderRow(name, callbacks, strength, storedInputTranslations[name] === true, storedInputTranslationsKr[name] === true, storedInputEnabled[name] !== false);
 			node.addCustomWidget(row);
 			node.jhInputPromptRows.set(name, row);
 			node.jhPromptItems.push(row);
@@ -567,6 +614,8 @@ function installPromptBuilder(node) {
 		node.jhPromptSlots = [];
 		baseRow.value.strength = Number.isFinite(Number(baseStrengthWidget.value)) ? Number(baseStrengthWidget.value) : 1;
 		baseRow.value.translate = baseTranslateWidget.value === true;
+		baseRow.value.translate_kr = baseTranslateKrWidget.value === true;
+		if (baseRow.value.translate_kr) baseRow.value.translate = false;
 		baseRow.value.enabled = baseEnabledWidget.value !== false;
 		node.jhPromptItems = [baseRow];
 		for (const data of parseSlots(storedWidget.value)) {
@@ -619,6 +668,8 @@ function installPromptBuilder(node) {
 			hideWidget(getWidget(this, "input_prompt_strengths"));
 			hideWidget(getWidget(this, "base_translate"));
 			hideWidget(getWidget(this, "input_prompt_translations"));
+			hideWidget(getWidget(this, "base_translate_kr"));
+			hideWidget(getWidget(this, "input_prompt_translations_kr"));
 			hideWidget(getWidget(this, "base_enabled"));
 			hideWidget(getWidget(this, "input_prompt_enabled"));
 			rebuild();

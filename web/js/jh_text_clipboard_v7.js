@@ -63,6 +63,9 @@ function blobToDataUrl(blob) {
 }
 
 async function readClipboardImageAsDataUrl() {
+	if (!window.isSecureContext || !navigator.clipboard?.read) {
+		return null;
+	}
 	const items = await navigator.clipboard.read();
 	for (const item of items) {
 		const imageType = item.types.find((type) => type.startsWith("image/"));
@@ -89,7 +92,52 @@ async function normalizeImageBlobToPng(blob) {
 
 async function writeImageBlobToClipboard(blob) {
 	blob = await normalizeImageBlobToPng(blob);
-	await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+
+	if (window.isSecureContext && navigator.clipboard?.write && window.ClipboardItem) {
+		try {
+			await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+			return;
+		} catch (error) {
+			// fall through to the execCommand path
+		}
+	}
+
+	if (copyImageViaExecCommand(blob)) {
+		return;
+	}
+
+	throw new Error(
+		"Clipboard image copy needs a secure context. Open this UI via http://localhost:8188 (a LAN IP is not enough)."
+	);
+}
+
+function copyImageViaExecCommand(blob) {
+	const url = URL.createObjectURL(blob);
+	try {
+		const image = document.createElement("img");
+		image.src = url;
+		image.style.position = "fixed";
+		image.style.left = "-9999px";
+		image.style.top = "0";
+		image.style.opacity = "0";
+		document.body.appendChild(image);
+		const range = document.createRange();
+		range.selectNodeContents(image);
+		const selection = window.getSelection();
+		selection.removeAllRanges();
+		selection.addRange(range);
+		let copied = false;
+		try {
+			copied = document.execCommand("copy");
+		} catch (error) {
+			copied = false;
+		}
+		selection.removeAllRanges();
+		image.remove();
+		return copied;
+	} finally {
+		URL.revokeObjectURL(url);
+	}
 }
 
 async function writeImageValueToClipboard(value) {
@@ -501,7 +549,7 @@ function installClipboardImageNode(node) {
 				toast("success", "Clipboard", "Image copied.");
 			} catch (error) {
 				console.error("[JH Image Clipboard] Clipboard copy failed:", error);
-				toast("warn", "Clipboard", "Image could not be copied.");
+				toast("warn", "Clipboard", error?.message || "Image could not be copied.");
 			}
 		};
 
@@ -718,7 +766,7 @@ function installImagePreviewNode(node) {
 			toast("success", "JH Image Preview", "Image copied.");
 		} catch (error) {
 			console.error("[JH Image Preview] Copy failed:", error);
-			toast("warn", "JH Image Preview", "The image could not be copied.");
+			toast("warn", "JH Image Preview", error?.message || "The image could not be copied.");
 		}
 	};
 
@@ -1311,6 +1359,33 @@ function installSavedTextPickerNode(node) {
 }
 
 function installPriorityPassthroughNode(node) {
+	if (!node.jhPriorityAutoBypassInstalled) {
+		node.jhPriorityAutoBypassInstalled = true;
+		let configuredMode = node.mode;
+		Object.defineProperty(node, "mode", {
+			configurable: true,
+			enumerable: true,
+			get() {
+				if (configuredMode !== 0) {
+					return configuredMode;
+				}
+				const graph = this.graph;
+				const connectedInputs = (this.inputs || []).filter((input) => /^input\d+$/.test(input.name?.split(".").at(-1) || "") && input.link != null);
+				return graph && connectedInputs.length > 0 && connectedInputs.every((input) => {
+					const link = graph.links?.[input.link];
+					return link && graph.getNodeById?.(link.origin_id)?.mode === 4;
+				}) ? 4 : configuredMode;
+			},
+			set(value) {
+				configuredMode = value;
+			},
+		});
+		const originalOnSerialize = node.onSerialize;
+		node.onSerialize = function (data) {
+			originalOnSerialize?.apply(this, arguments);
+			data.mode = configuredMode;
+		};
+	}
 	if (getWidget(node, "jh_priority_info")) {
 		node.jhUpdatePrioritySelectorLabel?.();
 		return;
@@ -1746,10 +1821,13 @@ async function installLoraStackNode(node) {
 }
 
 
-function makeTextClipboardActions(onPaste, onPasteAndRun) {
+function makeTextClipboardActions(ownerNode, onPaste, onPasteAndRun, getTranslationMode, setTranslationMode, getManualMode, setManualMode) {
 	const actions = [
 		{ id: "run", label: "PASTE & RUN", color: "#176b87", hover: "#2187a8", run: onPasteAndRun },
 		{ id: "paste", label: "PASTE ONLY", color: "#3b4654", hover: "#526173", run: onPaste },
+		{ id: "en", label: "EN", color: "#3b4654", hover: "#526173", run: () => setTranslationMode("en") },
+		{ id: "kr", label: "KR", color: "#3b4654", hover: "#526173", run: () => setTranslationMode("kr") },
+		{ id: "source", label: () => getManualMode() ? "INPUT 2 · MANUAL" : "INPUT 1 · CONNECTED", color: "#3b4654", hover: "#526173", run: setManualMode },
 		{ id: "hotkey", label: (widget) => widget.recording ? "PRESS SHORTCUT..." : `HOTKEY  ·  ${widget.value || "NOT SET"}`, color: "#40334d", hover: "#59436d", run: startHotkeyRecording },
 	];
 
@@ -1764,15 +1842,21 @@ function makeTextClipboardActions(onPaste, onPasteAndRun) {
 		hovered: null,
 		bounds: {},
 		computeSize(width) {
-			return [width || 0, 110];
+			return [Math.max(Number(width) || 0, Number(ownerNode.size?.[0]) || 0), 110];
 		},
 		draw(ctx, node, width, y) {
 			const margin = 15;
 			const innerWidth = width - margin * 2;
 			const pasteWidth = Math.floor(innerWidth * 0.48);
+			const translationGap = 4;
+			const translationWidth = Math.floor((innerWidth - pasteWidth - 8 - translationGap) / 2);
 			const hotkeyWidth = Math.min(160, Math.floor(innerWidth * 0.55));
+			const sourceWidth = innerWidth - hotkeyWidth - 8;
 			this.bounds.run = [margin, y, innerWidth, 36];
 			this.bounds.paste = [margin, y + 52, pasteWidth, 24];
+			this.bounds.en = [margin + pasteWidth + 8, y + 52, translationWidth, 24];
+			this.bounds.kr = [margin + pasteWidth + 8 + translationWidth + translationGap, y + 52, translationWidth, 24];
+			this.bounds.source = [margin, y + 84, sourceWidth, 18];
 			this.bounds.hotkey = [margin + innerWidth - hotkeyWidth, y + 84, hotkeyWidth, 18];
 
 			ctx.save();
@@ -1780,7 +1864,9 @@ function makeTextClipboardActions(onPaste, onPasteAndRun) {
 			ctx.textBaseline = "middle";
 			for (const action of actions) {
 				const [x, buttonY, buttonWidth, buttonHeight] = this.bounds[action.id];
-				ctx.fillStyle = this.hovered === action.id ? action.hover : action.color;
+				const activeTranslation = (action.id === "en" || action.id === "kr") && getTranslationMode() === action.id;
+				const activeManual = action.id === "source" && getManualMode();
+				ctx.fillStyle = activeTranslation || activeManual ? "#39785e" : (this.hovered === action.id ? action.hover : action.color);
 				if (this.pressed === action.id) {
 					ctx.globalAlpha = 0.72;
 				}
@@ -1788,8 +1874,8 @@ function makeTextClipboardActions(onPaste, onPasteAndRun) {
 				ctx.roundRect(x, buttonY, buttonWidth, buttonHeight, 6);
 				ctx.fill();
 				ctx.globalAlpha = 1;
-				ctx.fillStyle = action.id === "run" ? "#f4fbff" : "#d9dde2";
-				ctx.font = action.id === "run" ? "600 12px sans-serif" : "600 9px sans-serif";
+				ctx.fillStyle = action.id === "run" ? "#f4fbff" : (activeTranslation || activeManual ? "#eafff4" : "#d9dde2");
+				ctx.font = action.id === "run" ? "600 12px sans-serif" : ((action.id === "en" || action.id === "kr") ? "700 10px sans-serif" : "600 9px sans-serif");
 				const label = typeof action.label === "function" ? action.label(this) : action.label;
 				ctx.fillText(label, x + buttonWidth / 2, buttonY + buttonHeight / 2 + 0.5);
 			}
@@ -1824,31 +1910,129 @@ function makeTextClipboardActions(onPaste, onPasteAndRun) {
 	};
 }
 
+function makeClipboardOutputPanel(node) {
+	const panel = document.createElement("div");
+	Object.assign(panel.style, {
+		display: "grid",
+		gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)",
+		gap: "8px",
+		width: "100%",
+		height: "100%",
+		minHeight: "0",
+		boxSizing: "border-box",
+	});
+
+	const makeColumn = (labelText) => {
+		const column = document.createElement("div");
+		Object.assign(column.style, { display: "flex", flexDirection: "column", minWidth: "0", minHeight: "0", gap: "4px" });
+		const label = document.createElement("div");
+		label.textContent = labelText;
+		Object.assign(label.style, { color: "#aaa", font: "600 10px sans-serif", letterSpacing: "0.4px" });
+		const textarea = document.createElement("textarea");
+		textarea.readOnly = true;
+		textarea.spellcheck = false;
+		Object.assign(textarea.style, {
+			width: "100%",
+			height: "100%",
+			minHeight: "130px",
+			resize: "none",
+			boxSizing: "border-box",
+			border: "1px solid #555",
+			borderRadius: "6px",
+			padding: "8px",
+			background: "#181818",
+			color: "#ddd",
+			font: "12px sans-serif",
+			lineHeight: "1.4",
+		});
+		column.append(label, textarea);
+		panel.append(column);
+		return { label, textarea };
+	};
+
+	const original = makeColumn("ORIGINAL");
+	const translated = makeColumn("TRANSLATION");
+	const widget = node.addDOMWidget("jh_clipboard_output_panel", "output", panel, {
+		serialize: false,
+		hideOnZoom: false,
+		getMinHeight: () => 170,
+	});
+	widget.serialize = false;
+	return {
+		widget,
+		setValues(originalText, translatedText, mode) {
+			original.textarea.value = originalText || "";
+			translated.textarea.value = translatedText || "";
+			translated.label.textContent = mode === "en" ? "ENGLISH" : (mode === "kr" ? "KOREAN" : "TRANSLATION");
+		},
+	};
+}
+
 function installClipboardTextNode(node) {
 	const textWidget = getWidget(node, "text");
 	const overrideWidget = getWidget(node, "clipboard_override");
 	const outputWidget = getWidget(node, "display_text");
-	if (!textWidget || !overrideWidget || !outputWidget) {
+	const providerWidget = getWidget(node, "translation_provider");
+	const translateEnWidget = getWidget(node, "translate_en");
+	const translateKrWidget = getWidget(node, "translate_kr");
+	const translatedOutputWidget = getWidget(node, "display_translated_text");
+	const manualTextWidget = getWidget(node, "manual_text");
+	const useManualTextWidget = getWidget(node, "use_manual_text");
+	if (!textWidget || !overrideWidget || !outputWidget || !providerWidget || !translateEnWidget || !translateKrWidget || !translatedOutputWidget || !manualTextWidget || !useManualTextWidget) {
 		return;
 	}
 	hideWidget(overrideWidget);
-	outputWidget.label = "OUTPUT";
-	if (outputWidget.inputEl) {
-		outputWidget.inputEl.readOnly = true;
-		outputWidget.inputEl.style.opacity = 0.75;
-	}
+	hideWidget(outputWidget);
+	hideWidget(translatedOutputWidget);
+	hideWidget(translateEnWidget);
+	hideWidget(translateKrWidget);
+	hideWidget(useManualTextWidget);
+	textWidget.label = "Input 1 · Connected";
+	providerWidget.label = "Translation";
+	manualTextWidget.label = "Input 2 · Manual Prompt";
+	if (translateKrWidget.value === true) setWidgetValue(node, translateEnWidget, false);
 	overrideWidget.serializeValue = () => node.jhForceClipboardText
 		? JSON.stringify({ force: true, text: node.jhClipboardOverrideText ?? "" })
 		: "";
 	if (getWidget(node, "jh_text_clipboard_hotkey")) {
 		return;
 	}
+	const getTranslationMode = () => translateKrWidget.value === true ? "kr" : (translateEnWidget.value === true ? "en" : "");
+	const getManualMode = () => useManualTextWidget.value === true;
+	const updateManualUi = () => {
+		if (manualTextWidget.inputEl) manualTextWidget.inputEl.style.opacity = getManualMode() ? "1" : "0.55";
+		node.setDirtyCanvas?.(true, true);
+	};
+	const setManualMode = () => {
+		setWidgetValue(node, useManualTextWidget, !getManualMode());
+		setWidgetValue(node, translatedOutputWidget, "");
+		if (node.properties) {
+			node.properties.jh_clipboard_translated_output = "";
+			node.properties.jh_clipboard_translation_cache_key = "";
+		}
+		updateManualUi();
+		node.jhClipboardOutputPanel?.setValues(outputWidget.value, "", getTranslationMode());
+	};
+	const setTranslationMode = (mode) => {
+		const nextMode = getTranslationMode() === mode ? "" : mode;
+		setWidgetValue(node, translateEnWidget, nextMode === "en");
+		setWidgetValue(node, translateKrWidget, nextMode === "kr");
+		setWidgetValue(node, translatedOutputWidget, "");
+		if (node.properties) {
+			node.properties.jh_clipboard_translated_output = "";
+			node.properties.jh_clipboard_translation_cache_key = "";
+		}
+		node.jhClipboardOutputPanel?.setValues(outputWidget.value, "", nextMode);
+	};
+	const outputPanel = makeClipboardOutputPanel(node);
+	node.jhClipboardOutputPanel = outputPanel;
+	outputPanel.setValues(outputWidget.value, translatedOutputWidget.value, getTranslationMode());
 
 	const pasteText = async () => {
 		try {
 			const text = await navigator.clipboard.readText();
 			node.jhClipboardOverrideText = text ?? "";
-			setWidgetValue(node, textWidget, node.jhClipboardOverrideText);
+			setWidgetValue(node, getManualMode() ? manualTextWidget : textWidget, node.jhClipboardOverrideText);
 			return true;
 		} catch (error) {
 			console.error("[JH Text Clipboard] Clipboard read failed:", error);
@@ -1880,7 +2064,7 @@ function installClipboardTextNode(node) {
 		try {
 			const text = await readPromptFromMediaFile(file);
 			this.jhClipboardOverrideText = text;
-			setWidgetValue(this, textWidget, text);
+			setWidgetValue(this, getManualMode() ? manualTextWidget : textWidget, text);
 			toast("success", "JH Text Clipboard", "Prompt loaded from file metadata.");
 		} catch (error) {
 			console.error("[JH Text Clipboard] Metadata drop failed:", error);
@@ -1915,34 +2099,73 @@ function installClipboardTextNode(node) {
 
 	node.jhHotkeyWidgetName = "jh_text_clipboard_hotkey";
 	node.jhHotkeyAction = node.jhPasteTextAndRun;
-	const actionsWidget = node.addCustomWidget(makeTextClipboardActions(pasteText, node.jhPasteTextAndRun));
+	const actionsWidget = node.addCustomWidget(makeTextClipboardActions(node, pasteText, node.jhPasteTextAndRun, getTranslationMode, setTranslationMode, getManualMode, setManualMode));
+	const syncClipboardWidgetWidths = () => {
+		const width = Number(node.size?.[0]) || 0;
+		outputPanel.widget.width = width;
+		actionsWidget.width = width;
+		outputPanel.widget.element.style.width = "100%";
+		node.setDirtyCanvas?.(true, true);
+	};
+	const originalOnResize = node.onResize;
+	node.onResize = function () {
+		originalOnResize?.apply(this, arguments);
+		syncClipboardWidgetWidths();
+	};
+	syncClipboardWidgetWidths();
 	const originalOnExecuted = node.onExecuted;
 	node.onExecuted = function (message) {
 		originalOnExecuted?.apply(this, arguments);
-		const text = Array.isArray(message?.text) ? message.text.join("\n") : (message?.text ?? "");
-		setWidgetValue(this, outputWidget, text);
+		const originalText = Array.isArray(message?.original_text) ? message.original_text.join("\n") : (message?.original_text ?? "");
+		const translatedText = Array.isArray(message?.translated_text) ? message.translated_text.join("\n") : (message?.translated_text ?? "");
+		const translationCacheKey = Array.isArray(message?.translation_cache_key) ? message.translation_cache_key[0] : (message?.translation_cache_key ?? "");
+		setWidgetValue(this, outputWidget, originalText);
+		setWidgetValue(this, translatedOutputWidget, translatedText);
+		this.properties ||= {};
+		this.properties.jh_clipboard_translation_cache_key = translationCacheKey;
+		this.jhClipboardOutputPanel?.setValues(originalText, translatedText, getTranslationMode());
 	};
 	const originalOnConfigure = node.onConfigure;
 	node.onConfigure = function (info) {
 		const configuredValues = info?.widgets_values;
 		originalOnConfigure?.apply(this, arguments);
-		if (Array.isArray(configuredValues) && configuredValues.length === 2 && typeof configuredValues[1] === "string") {
+		if (Array.isArray(configuredValues) && configuredValues.length === 8 && typeof configuredValues[7] === "string") {
+			actionsWidget.value = configuredValues[7];
+			manualTextWidget.value = "";
+			useManualTextWidget.value = false;
+		} else if (Array.isArray(configuredValues) && configuredValues.length === 4 && typeof configuredValues[3] === "string" && !["Papago", "Google"].includes(configuredValues[3])) {
+			actionsWidget.value = configuredValues[3];
+			setWidgetValue(this, providerWidget, "Papago");
+		} else if (Array.isArray(configuredValues) && configuredValues.length === 2 && typeof configuredValues[1] === "string") {
 			actionsWidget.value = configuredValues[1];
 			overrideWidget.value = "";
 		} else if (Array.isArray(configuredValues) && configuredValues.length === 3 && typeof configuredValues[2] === "string") {
 			actionsWidget.value = configuredValues[2];
 			outputWidget.value = "";
 		}
+		if (translateKrWidget.value === true) setWidgetValue(this, translateEnWidget, false);
 		hideWidget(overrideWidget);
+		hideWidget(outputWidget);
+		hideWidget(translatedOutputWidget);
+		hideWidget(translateEnWidget);
+		hideWidget(translateKrWidget);
+		hideWidget(useManualTextWidget);
 		const restoredOutput = info?.properties?.jh_clipboard_output;
+		const restoredTranslatedOutput = info?.properties?.jh_clipboard_translated_output;
 		if (typeof restoredOutput === "string") {
 			setWidgetValue(this, outputWidget, restoredOutput);
 		}
+		if (typeof restoredTranslatedOutput === "string") {
+			setWidgetValue(this, translatedOutputWidget, restoredTranslatedOutput);
+		}
+		this.jhClipboardOutputPanel?.setValues(outputWidget.value, translatedOutputWidget.value, getTranslationMode());
+		updateManualUi();
 	};
+	updateManualUi();
 	requestAnimationFrame(() => {
 		const size = node.computeSize?.();
 		if (size) {
-			node.onResize?.([Math.max(node.size[0], size[0]), Math.max(node.size[1], size[1])]);
+			node.onResize?.([Math.max(node.size[0], size[0], 440), Math.max(node.size[1], size[1])]);
 		}
 		app.graph?.setDirtyCanvas?.(true, true);
 	});
@@ -1971,6 +2194,64 @@ function setFeedWidgetVisible(widget, visible) {
 	}
 }
 
+const AUTO_FEED_WIDGET_NAMES = [
+	"source", "query", "ranking", "period", "safe_search", "scroll_rounds", "max_candidates",
+	"woman_threshold", "woman_model", "person_model", "seed", "headless", "title_filter", "search_mode",
+	"history_mode", "history_commit", "orientation_mode", "crop_mode", "crop_margin", "dc_gallery",
+	"dc_gallery_custom", "dc_random_mode", "arca_channel", "reddit_mode", "reddit_subreddit", "reddit_keyword",
+	"media_mode", "video_scan_fps", "video_max_seconds", "quality_filter", "min_popularity", "min_comments",
+	"min_views", "min_megapixels", "face_check", "face_confidence", "face_model", "arca_mode",
+	"url_single_character_sheet", "directory_path", "directory_recursive", "processing_mode", "search_timeout_minutes",
+];
+
+const AUTO_FEED_LEGACY_WIDGET_NAMES = AUTO_FEED_WIDGET_NAMES.filter((name) => ![
+	"history_commit", "directory_path", "directory_recursive", "processing_mode", "search_timeout_minutes",
+].includes(name));
+
+function autoFeedWidgetSnapshot(node) {
+	return Object.fromEntries(AUTO_FEED_WIDGET_NAMES.flatMap((name) => {
+		const widget = getWidget(node, name);
+		return widget ? [[name, widget.value]] : [];
+	}));
+}
+
+function autoFeedNamedValuesFromConfig(info) {
+	const named = info?.widgets_values_named;
+	if (named && typeof named === "object" && !Array.isArray(named)) return named;
+	const stored = info?.properties?.jh_auto_feed_widget_values;
+	if (stored && typeof stored === "object" && !Array.isArray(stored)) return stored;
+	if (!Array.isArray(info?.widgets_values)) return null;
+
+	let values = [...info.widgets_values];
+	// Older saves contain three null holes where non-serializing proxy widgets were inserted.
+	if (values.length >= 4 && values.slice(1, 4).every((value) => value == null)) {
+		values = [values[0], ...values.slice(4)];
+	}
+	const currentHistoryValues = new Set(["On Image Load", "On Workflow Success"]);
+	const legacyWithAppendedFields = values.length > AUTO_FEED_LEGACY_WIDGET_NAMES.length
+		&& !currentHistoryValues.has(values[15]);
+	const names = values.length <= AUTO_FEED_LEGACY_WIDGET_NAMES.length
+		? AUTO_FEED_LEGACY_WIDGET_NAMES
+		: legacyWithAppendedFields
+			? [...AUTO_FEED_LEGACY_WIDGET_NAMES, "directory_path", "directory_recursive", "processing_mode", "search_timeout_minutes"]
+			: AUTO_FEED_WIDGET_NAMES;
+	return Object.fromEntries(values.slice(0, names.length).map((value, index) => [names[index], value]));
+}
+
+function applyAutoFeedNamedValues(node, values) {
+	if (!values || typeof values !== "object") return false;
+	let applied = false;
+	for (const name of AUTO_FEED_WIDGET_NAMES) {
+		if (!(name in values)) continue;
+		const widget = getWidget(node, name);
+		if (!widget) continue;
+		widget.value = values[name];
+		if (widget.inputEl) widget.inputEl.value = values[name] ?? "";
+		applied = true;
+	}
+	return applied;
+}
+
 function installAutoImageFeedNode(node) {
 	installAutoFeedPreview(node);
 	if (node.jhAutoImageFeedInstalled) {
@@ -1984,6 +2265,39 @@ function installAutoImageFeedNode(node) {
 		return;
 	}
 	node.jhAutoImageFeedInstalled = true;
+	const processingModeWidget = getWidget(node, "processing_mode");
+	const directoryPathWidget = getWidget(node, "directory_path");
+	const directoryRecursiveWidget = getWidget(node, "directory_recursive");
+	const processingModeProxy = node.addWidget("toggle", "processing mode", processingModeWidget?.value === "Simple", (value) => {
+		if (processingModeWidget) setWidgetValue(node, processingModeWidget, value ? "Simple" : "Advanced");
+		node.jhUpdateAutoImageFeedUi?.();
+	}, { on: "Simple", off: "Advanced", serialize: false });
+	processingModeProxy.name = "jh_processing_mode";
+	processingModeProxy.label = "processing mode";
+	processingModeProxy.serialize = false;
+	const directoryPathProxy = node.addWidget("text", "local / NAS directory path", directoryPathWidget?.value || "", (value) => {
+		if (directoryPathWidget) setWidgetValue(node, directoryPathWidget, value);
+	}, { serialize: false });
+	directoryPathProxy.name = "jh_directory_path";
+	directoryPathProxy.label = "local / NAS directory path";
+	directoryPathProxy.serialize = false;
+	const directoryRecursiveProxy = node.addWidget("toggle", "include subdirectories", directoryRecursiveWidget?.value ?? true, (value) => {
+		if (directoryRecursiveWidget) setWidgetValue(node, directoryRecursiveWidget, Boolean(value));
+	}, { on: "Yes", off: "No", serialize: false });
+	directoryRecursiveProxy.name = "jh_directory_recursive";
+	directoryRecursiveProxy.label = "include subdirectories";
+	directoryRecursiveProxy.serialize = false;
+	let directoryInsertIndex = node.widgets.indexOf(sourceWidget) + 1;
+	for (const widget of [processingModeProxy, directoryPathProxy, directoryRecursiveProxy]) {
+		const widgetIndex = node.widgets.indexOf(widget);
+		if (widgetIndex < directoryInsertIndex) directoryInsertIndex -= 1;
+		node.widgets.splice(widgetIndex, 1);
+		node.widgets.splice(directoryInsertIndex, 0, widget);
+		directoryInsertIndex += 1;
+	}
+	setFeedWidgetVisible(processingModeWidget, false);
+	setFeedWidgetVisible(directoryPathWidget, false);
+	setFeedWidgetVisible(directoryRecursiveWidget, false);
 	const stopButton = node.addWidget("button", "Stop Auto Image Feed", "Stop Auto Image Feed", async () => {
 		const previewWidget = getWidget(node, "jh_auto_feed_preview");
 		if (previewWidget) previewWidget.status = "Stop requested...";
@@ -2059,6 +2373,7 @@ function installAutoImageFeedNode(node) {
 	};
 
 	const sourceUi = {
+		"Local / NAS Directory": { showQuery: false, show: ["jh_directory_path", "jh_directory_recursive", "media_mode", "video_scan_fps", "video_max_seconds"] },
 		"Google Images": { label: "search keywords", placeholder: "portrait photography woman", show: ["period", "safe_search", "scroll_rounds"] },
 		"Instagram User": { label: "Instagram username", placeholder: "natgeo", show: ["scroll_rounds", "media_mode", "video_scan_fps", "video_max_seconds", "quality_filter", "min_popularity", "min_comments"] },
 		"Instagram Hashtag": { label: "Instagram hashtag", placeholder: "portraitphotography", show: ["scroll_rounds", "media_mode", "video_scan_fps", "video_max_seconds", "quality_filter", "min_popularity", "min_comments"] },
@@ -2073,8 +2388,8 @@ function installAutoImageFeedNode(node) {
 			show: ["period", "safe_search", "scroll_rounds", "quality_filter", "min_popularity", "min_comments", "min_views"],
 		},
 	};
-	const conditionalWidgets = ["period", "safe_search", "scroll_rounds", "dc_gallery", "dc_gallery_custom", "title_filter", "dc_random_mode", "arca_channel", "arca_mode", "reddit_mode", "reddit_subreddit", "reddit_keyword", "search_mode", "media_mode", "video_scan_fps", "video_max_seconds", "quality_filter", "min_popularity", "min_comments", "min_views", "url_single_character_sheet"];
-	const rememberedWidgetNames = ["query", "max_candidates", ...conditionalWidgets];
+	const conditionalWidgets = ["period", "safe_search", "scroll_rounds", "dc_gallery", "dc_gallery_custom", "title_filter", "dc_random_mode", "arca_channel", "arca_mode", "reddit_mode", "reddit_subreddit", "reddit_keyword", "search_mode", "media_mode", "video_scan_fps", "video_max_seconds", "quality_filter", "min_popularity", "min_comments", "min_views", "url_single_character_sheet", "jh_directory_path", "jh_directory_recursive"];
+	const rememberedWidgetNames = ["query", "max_candidates", "directory_path", "directory_recursive", ...conditionalWidgets.filter((name) => !name.startsWith("jh_directory_"))];
 	const widgetDefaults = Object.fromEntries(rememberedWidgetNames.map((name) => {
 		const widget = getWidget(node, name);
 		return [name, widget?.options?.default ?? widget?.options?.values?.[0] ?? widget?.value];
@@ -2102,6 +2417,7 @@ function installAutoImageFeedNode(node) {
 		const dcCustomWidget = getWidget(node, "dc_gallery_custom");
 		const titleFilterWidget = getWidget(node, "title_filter");
 		const maxCandidatesWidget = getWidget(node, "max_candidates");
+		const searchTimeoutWidget = getWidget(node, "search_timeout_minutes");
 		const dcRandomModeWidget = getWidget(node, "dc_random_mode");
 		const arcaChannelWidget = getWidget(node, "arca_channel");
 		const arcaModeWidget = getWidget(node, "arca_mode");
@@ -2119,6 +2435,19 @@ function installAutoImageFeedNode(node) {
 		const faceCheckWidget = getWidget(node, "face_check");
 		const faceConfidenceWidget = getWidget(node, "face_confidence");
 		const faceModelWidget = getWidget(node, "face_model");
+		const historyModeWidget = getWidget(node, "history_mode");
+		const historyCommitWidget = getWidget(node, "history_commit");
+		const processingModeWidget = getWidget(node, "processing_mode");
+		const processingModeProxy = getWidget(node, "jh_processing_mode");
+		const directoryPathWidget = getWidget(node, "directory_path");
+		const directoryRecursiveWidget = getWidget(node, "directory_recursive");
+		const directoryPathProxy = getWidget(node, "jh_directory_path");
+		const directoryRecursiveProxy = getWidget(node, "jh_directory_recursive");
+		if (historyModeWidget?.value === "On Workflow Success") {
+			historyModeWidget.value = "Normal";
+			if (historyCommitWidget) historyCommitWidget.value = "On Workflow Success";
+		}
+		if (processingModeProxy && processingModeWidget) processingModeProxy.value = processingModeWidget.value === "Simple";
 		if (redditModeWidget && !["Subreddit", "Keyword Search"].includes(redditModeWidget.value)) {
 			redditModeWidget.value = "Subreddit";
 		}
@@ -2144,10 +2473,13 @@ function installAutoImageFeedNode(node) {
 			titleFilterWidget.label = "title contains (or re:regex)";
 		}
 		if (maxCandidatesWidget) {
-			maxCandidatesWidget.label = sourceWidget.value === "Arca.live Channel"
-				? "posts per page (0 = search until found)"
-				: "max candidates (0 = search until found)";
+			maxCandidatesWidget.label = sourceWidget.value === "Local / NAS Directory"
+				? "max images (0 = all available)"
+				: sourceWidget.value === "Arca.live Channel"
+					? "posts per page (0 = search until found)"
+					: "max candidates (0 = search until found)";
 		}
+		if (searchTimeoutWidget) searchTimeoutWidget.label = "search timeout (minutes)";
 		const urlSingleCharacterSheetWidget = getWidget(node, "url_single_character_sheet");
 		if (urlSingleCharacterSheetWidget) {
 			urlSingleCharacterSheetWidget.label = "URL character sheets";
@@ -2201,6 +2533,23 @@ function installAutoImageFeedNode(node) {
 			faceConfidenceWidget.label = "minimum face confidence";
 		}
 		if (faceModelWidget) faceModelWidget.label = "face detector";
+		if (historyModeWidget) historyModeWidget.label = "history input policy";
+		if (historyCommitWidget) historyCommitWidget.label = "history save timing";
+		setFeedWidgetVisible(historyCommitWidget, historyModeWidget?.value === "Normal");
+		setFeedWidgetVisible(processingModeWidget, false);
+		if (directoryPathProxy && directoryPathWidget && document.activeElement !== directoryPathProxy.inputEl) {
+			directoryPathProxy.value = directoryPathWidget.value;
+		}
+		if (directoryRecursiveProxy && directoryRecursiveWidget) directoryRecursiveProxy.value = Boolean(directoryRecursiveWidget.value);
+		setFeedWidgetVisible(directoryPathWidget, false);
+		setFeedWidgetVisible(directoryRecursiveWidget, false);
+		const simpleMode = processingModeWidget?.value === "Simple";
+		for (const name of [
+			"woman_threshold", "woman_model", "person_model", "orientation_mode", "crop_mode", "crop_margin",
+			"min_megapixels", "face_check",
+		]) {
+			setFeedWidgetVisible(getWidget(node, name), !simpleMode);
+		}
 		const config = sourceUi[sourceWidget.value] || sourceUi["Google Images"];
 		setFeedWidgetVisible(queryWidget, config.showQuery !== false);
 		if (config.label) {
@@ -2213,6 +2562,10 @@ function installAutoImageFeedNode(node) {
 			setFeedWidgetVisible(getWidget(node, name), config.show.includes(name));
 		}
 		setFeedWidgetVisible(maxCandidatesWidget, sourceWidget.value !== "Website URL");
+		setFeedWidgetVisible(
+			searchTimeoutWidget,
+			sourceWidget.value !== "Local / NAS Directory" && sourceWidget.value !== "Website URL" && Number(maxCandidatesWidget?.value) === 0,
+		);
 		if (sourceWidget.value === "DCInside Gallery") {
 			setFeedWidgetVisible(dcCustomWidget, dcGalleryWidget?.value === "직접 입력 (ID/URL)");
 		}
@@ -2229,6 +2582,15 @@ function installAutoImageFeedNode(node) {
 		}
 		setFeedWidgetVisible(faceConfidenceWidget, Boolean(faceCheckWidget?.value));
 		setFeedWidgetVisible(faceModelWidget, Boolean(faceCheckWidget?.value));
+		if (simpleMode) {
+			for (const name of [
+				"woman_threshold", "woman_model", "person_model", "orientation_mode", "crop_mode", "crop_margin",
+				"quality_filter", "min_popularity", "min_comments", "min_views", "min_megapixels",
+				"face_check", "face_confidence", "face_model",
+			]) {
+				setFeedWidgetVisible(getWidget(node, name), false);
+			}
+		}
 		requestAnimationFrame(() => {
 			const computed = node.computeSize?.();
 			if (computed) {
@@ -2295,6 +2657,26 @@ function installAutoImageFeedNode(node) {
 			updateSourceUi();
 		};
 	};
+	const installHistoryModeCallback = () => {
+		const historyModeWidget = getWidget(node, "history_mode");
+		if (!historyModeWidget || historyModeWidget.jhAutoImageFeedInstalled) return;
+		historyModeWidget.jhAutoImageFeedInstalled = true;
+		const historyModeCallback = historyModeWidget.callback;
+		historyModeWidget.callback = function(value) {
+			historyModeCallback?.apply(this, arguments);
+			updateSourceUi();
+		};
+	};
+	const installMaxCandidatesCallback = () => {
+		const maxCandidatesWidget = getWidget(node, "max_candidates");
+		if (!maxCandidatesWidget || maxCandidatesWidget.jhAutoImageFeedInstalled) return;
+		maxCandidatesWidget.jhAutoImageFeedInstalled = true;
+		const maxCandidatesCallback = maxCandidatesWidget.callback;
+		maxCandidatesWidget.callback = function(value) {
+			maxCandidatesCallback?.apply(this, arguments);
+			updateSourceUi();
+		};
+	};
 	const installFaceCheckCallback = () => {
 		const faceCheckWidget = getWidget(node, "face_check");
 		if (!faceCheckWidget || faceCheckWidget.jhAutoImageFeedInstalled) return;
@@ -2305,10 +2687,39 @@ function installAutoImageFeedNode(node) {
 			updateSourceUi();
 		};
 	};
+	const originalOnSerialize = node.onSerialize;
+	node.onSerialize = function (info) {
+		originalOnSerialize?.apply(this, arguments);
+		saveSourceValues(activeSource);
+		const namedValues = autoFeedWidgetSnapshot(this);
+		info.widgets_values = AUTO_FEED_WIDGET_NAMES.map((name) => namedValues[name] ?? null);
+		info.widgets_values_named = { ...namedValues };
+		info.properties ||= {};
+		info.properties.jh_auto_feed_widget_values = { ...namedValues };
+		if (this.properties?.jh_auto_feed_source_values) {
+			info.properties.jh_auto_feed_source_values = JSON.parse(JSON.stringify(this.properties.jh_auto_feed_source_values));
+		}
+	};
+	const originalOnConfigure = node.onConfigure;
+	node.onConfigure = function (info) {
+		originalOnConfigure?.apply(this, arguments);
+		const namedValues = autoFeedNamedValuesFromConfig(info);
+		if (applyAutoFeedNamedValues(this, namedValues)) {
+			this.properties ||= {};
+			this.properties.jh_auto_feed_widget_values = autoFeedWidgetSnapshot(this);
+			activeSource = sourceWidget.value;
+		}
+		requestAnimationFrame(() => {
+			updateSourceUi();
+			updateRecentOptions();
+		});
+	};
 	installDcGalleryCallback();
 	installRedditModeCallback();
 	installMediaModeCallback();
 	installQualityFilterCallback();
+	installHistoryModeCallback();
+	installMaxCandidatesCallback();
 	installFaceCheckCallback();
 	updateSourceUi();
 	node.jhRefreshAutoFeedPresets();
@@ -2317,6 +2728,8 @@ function installAutoImageFeedNode(node) {
 		installRedditModeCallback();
 		installMediaModeCallback();
 		installQualityFilterCallback();
+		installHistoryModeCallback();
+		installMaxCandidatesCallback();
 		installFaceCheckCallback();
 		updateSourceUi();
 	}));
